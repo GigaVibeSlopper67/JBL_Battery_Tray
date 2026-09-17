@@ -132,14 +132,15 @@ python3 ./jbl_quantum910_tray.py --notify-mute      # also notify on mute change
 
 ## Installation (recommended) — starts with the system (login)
 
-This installs as a **`systemd --user` service** (starts when you log in to the desktop).
+Installs as a **`systemd --user` service** when systemd is available; on systems **without systemd** it automatically falls back to an **XDG autostart entry** (`~/.config/autostart`). Any arguments are baked into the launcher and apply to every launch (service, autostart and manual runs):
 
 ```bash
 chmod +x ./install.sh
-./install.sh
+./install.sh --enable-controls   # controls: ANC, lights, sidetone, RGB lighting
+# add more tray flags if you want, e.g. --notify-mute
 ```
 
-To remove:
+To change the flags later, re-run the installer. To remove:
 
 ```bash
 chmod +x ./uninstall.sh

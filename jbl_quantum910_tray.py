@@ -1411,7 +1411,7 @@ class BatteryTrayApp:
                     sub.join_group(group_leader)
                 else:
                     group_leader = sub
-                sub.connect("activate", lambda _w, v=value: self._set_sidetone(v))
+                sub.connect("activate", lambda _w, v=value: self._on_sidetone_radio(v))
                 sidetone_menu.append(sub)
                 self._sidetone_radio_items[value] = sub
             sidetone_item = self.Gtk.MenuItem(label="Sidetone")
@@ -1473,16 +1473,32 @@ class BatteryTrayApp:
             self._sidetone = value
             self._update_sidetone_radios()
 
+    def _on_sidetone_radio(self, value: int) -> None:
+        """Menu handler; ignores the programmatic radio sync.
+
+        GTK3 RadioMenuItems emit "activate" not only on user clicks but also
+        from set_active(True) during _update_sidetone_radios() - without
+        this guard the startup sync would re-send the current sidetone
+        value to the headset on every app start.
+        """
+        if getattr(self, "_sidetone_radios_syncing", False):
+            return
+        self._set_sidetone(value)
+
     def _update_sidetone_radios(self) -> None:
         """Reflect the current sidetone level in the radio menu items."""
         items = getattr(self, "_sidetone_radio_items", None)
         if not items:
             return
-        for value, item in items.items():
-            try:
-                item.set_active(value == self._sidetone)
-            except Exception:
-                pass
+        self._sidetone_radios_syncing = True
+        try:
+            for value, item in items.items():
+                try:
+                    item.set_active(value == self._sidetone)
+                except Exception:
+                    pass
+        finally:
+            self._sidetone_radios_syncing = False
 
     def _set_lighting_color(self, rgb: tuple) -> None:
         """Write one color to both lighting elements (logo + ring).
