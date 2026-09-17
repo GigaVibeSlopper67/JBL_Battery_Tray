@@ -1,158 +1,157 @@
-# Troubleshooting - Erros Comuns
+# Troubleshooting - Common Errors
 
-## Erro: `[Errno 5] Input/output error`
+## Error: `[Errno 5] Input/output error`
 
-### Causa
-Este erro geralmente ocorre quando:
-1. O dispositivo está sendo usado por outro programa
-2. O dispositivo foi desconectado durante a leitura
-3. O driver do kernel está controlando o dispositivo
-4. Há conflito de acesso ao dispositivo
+### Cause
+This error usually occurs when:
+1. The device is being used by another program
+2. The device was disconnected during reading
+3. A kernel driver is controlling the device
+4. There is an access conflict with the device
 
-### Soluções
+### Solutions
 
-#### 1. Verificar se outro programa está usando o dispositivo
+#### 1. Check if another program is using the device
 
 ```bash
-# Ver processos usando o dispositivo
+# See processes using the device
 lsof /dev/hidraw5
-# ou
+# or
 fuser /dev/hidraw5
 ```
 
-Se houver processos, encerre-os:
+If there are processes, terminate them:
 ```bash
 sudo kill <PID>
 ```
 
-#### 2. Verificar se o dispositivo está conectado
+#### 2. Check if the device is connected
 
 ```bash
 lsusb | grep JBL
 ls -la /dev/hidraw5
 ```
 
-Se não aparecer, o dispositivo foi desconectado.
+If it doesn't appear, the device was disconnected.
 
-#### 3. Desanexar driver do kernel (se usar pyusb)
+#### 3. Detach the kernel driver (if using pyusb)
 
 ```bash
-# Verificar qual driver está usando
+# Check which driver is being used
 lsmod | grep usbhid
 
-# Desanexar (pode ser necessário)
+# Detach (may be necessary)
 sudo modprobe -r usbhid
 sudo modprobe usbhid
 ```
 
-**Cuidado:** Isso pode afetar outros dispositivos USB HID.
+**Careful:** This may affect other USB HID devices.
 
-#### 4. Reiniciar o dispositivo
+#### 4. Restart the device
 
-1. Desconecte o fone USB
-2. Aguarde 2 segundos
-3. Reconecte o fone USB
-4. Execute o script novamente
+1. Disconnect the headset's USB cable
+2. Wait 2 seconds
+3. Reconnect the headset's USB cable
+4. Run the script again
 
-#### 5. Verificar permissões
+#### 5. Check permissions
 
 ```bash
 ls -la /dev/hidraw5
-# Deve mostrar: crw-rw-rw- ou crw-rw----
+# It should show: crw-rw-rw- or crw-rw----
 
-# Se não tiver permissão:
+# If you don't have permission:
 sudo chmod 666 /dev/hidraw5
 ```
 
-#### 6. Usar script que não precisa de pyusb
+#### 6. Use a script that doesn't need pyusb
 
-Se o erro ocorrer com `jbl_battery_monitor.py` (pyusb), use:
+If the error occurs with `jbl_battery_monitor.py` (pyusb), use:
 
 ```bash
 sudo python3 jbl_battery_simple.py
-# ou
+# or
 sudo python3 jbl_battery_hidraw.py
 ```
 
-Estes scripts usam hidraw diretamente e são mais estáveis.
+These scripts use hidraw directly and are more stable.
 
-## Erro: `Permission denied`
+## Error: `Permission denied`
 
-### Solução
+### Solution
 ```bash
 sudo python3 jbl_battery_simple.py
 ```
 
-Ou configure regras udev (veja `setup_udev_rules.sh).
+Or set up the udev rules (see `setup_udev_rules.sh`).
 
-## Erro: `ModuleNotFoundError: No module named 'usb'`
+## Error: `ModuleNotFoundError: No module named 'usb'`
 
-### Solução
+### Solution
 ```bash
-# Para usuário normal
+# For a normal user
 pip3 install pyusb --user
 
-# Para root (se usar sudo)
+# For root (if using sudo)
 sudo pip3 install pyusb
 ```
 
-Ou use scripts que não precisam de pyusb:
+Or use scripts that don't need pyusb:
 ```bash
 sudo python3 jbl_battery_simple.py
 ```
 
-## Dispositivo não envia dados
+## Device doesn't send data
 
-### Possíveis causas:
-1. Dispositivo não está enviando periodicamente
-2. Precisa pressionar botões para ativar
-3. Dispositivo em modo de economia de energia
+### Possible causes:
+1. The device isn't sending data periodically
+2. Buttons need to be pressed to trigger it
+3. The device is in power-saving mode
 
-### Soluções:
-1. **Aguarde** - O dispositivo envia a cada 7-11 segundos
-2. **Pressione botões** do fone para ativar comunicação
-3. **Use o fone** - Reproduza áudio, ajuste volume
-4. **Reconecte** o dispositivo
+### Solutions:
+1. **Wait** - The device sends data every 7-11 seconds
+2. **Press buttons** on the headset to trigger communication
+3. **Use the headset** - Play audio, adjust the volume
+4. **Reconnect** the device
 
-## Script trava ou não responde
+## Script hangs or doesn't respond
 
-### Solução:
-1. Pressione `Ctrl+C` para interromper
-2. Verifique se o dispositivo está conectado
-3. Reinicie o script
+### Solution:
+1. Press `Ctrl+C` to stop it
+2. Check that the device is connected
+3. Restart the script
 
-## Múltiplos erros de I/O
+## Multiple I/O errors
 
-Se você receber muitos erros de I/O:
+If you get many I/O errors:
 
-1. **Desconecte e reconecte** o fone
-2. **Reinicie o script**
-3. **Verifique** se há outros programas usando o dispositivo:
+1. **Disconnect and reconnect** the headset
+2. **Restart the script**
+3. **Check** whether other programs are using the device:
    ```bash
    ps aux | grep -i jbl
    ps aux | grep -i quantum
    ```
 
-## Dicas Gerais
+## General Tips
 
-1. **Use `jbl_battery_simple.py`** - É o mais estável
-2. **Execute com sudo** - Evita problemas de permissão
-3. **Aguarde alguns segundos** - O dispositivo envia periodicamente
-4. **Não use múltiplos scripts ao mesmo tempo** - Pode causar conflito
+1. **Use `jbl_battery_simple.py`** - It's the most stable
+2. **Run with sudo** - Avoids permission problems
+3. **Wait a few seconds** - The device sends data periodically
+4. **Don't run multiple scripts at the same time** - It can cause conflicts
 
-## Se Nada Funcionar
+## If Nothing Works
 
-1. Desconecte o fone
-2. Aguarde 5 segundos
-3. Reconecte o fone
-4. Aguarde 2 segundos
-5. Execute:
+1. Disconnect the headset
+2. Wait 5 seconds
+3. Reconnect the headset
+4. Wait 2 seconds
+5. Run:
    ```bash
    sudo python3 jbl_battery_simple.py
    ```
 
-Se ainda não funcionar, verifique:
-- Se o dispositivo aparece em `lsusb`
-- Se o hidraw existe: `ls -la /dev/hidraw*`
-- Se há erros no dmesg: `dmesg | tail -20`
-
+If it still doesn't work, check:
+- Whether the device appears in `lsusb`
+- Whether the hidraw exists: `ls -la /dev/hidraw*`
+- Whether there are errors in dmesg: `dmesg | tail -20`

@@ -1,89 +1,88 @@
-# Monitor de Bateria JBL Quantum910 Wireless
+# JBL Quantum910 Wireless Battery Monitor
 
-Scripts para interceptar a comunicação USB do fone JBL Quantum910 e extrair informações de bateria.
+Scripts to intercept the USB communication of the JBL Quantum910 headset and extract battery information.
 
-## Scripts Disponíveis
+## Available Scripts
 
-### 1. `jbl_battery_monitor.py` (usando pyusb)
-Script principal que usa a biblioteca `pyusb` para comunicação direta com o dispositivo USB.
+### 1. `jbl_battery_monitor.py` (using pyusb)
+Main script that uses the `pyusb` library for direct communication with the USB device.
 
-### 2. `jbl_battery_hidapi.py` (usando hidapi)
-Script alternativo usando `hidapi`, que pode ser mais fácil de usar em alguns sistemas.
+### 2. `jbl_battery_hidapi.py` (using hidapi)
+Alternative script using `hidapi`, which can be easier to use on some systems.
 
-## Requisitos
+## Requirements
 
 ```bash
 pip3 install pyusb --user
-# ou
+# or
 pip3 install hidapi --user
 ```
 
-## Permissões
+## Permissions
 
-Para acessar dispositivos USB, você pode precisar de permissões especiais:
+To access USB devices, you may need special permissions:
 
-### Opção 1: Executar como root (não recomendado)
+### Option 1: Run as root (not recommended)
 ```bash
 sudo python3 /tmp/jbl_battery_monitor.py
 ```
 
-### Opção 2: Configurar udev rules (recomendado)
-Crie o arquivo `/etc/udev/rules.d/99-jbl-quantum910.rules`:
+### Option 2: Set up udev rules (recommended)
+Create the file `/etc/udev/rules.d/99-jbl-quantum910.rules`:
 
 ```
 SUBSYSTEM=="usb", ATTR{idVendor}=="0ecb", ATTR{idProduct}=="2088", MODE="0666"
 ```
 
-Depois recarregue as regras:
+Then reload the rules:
 ```bash
 sudo udevadm control --reload-rules
 sudo udevadm trigger
 ```
 
-### Opção 3: Adicionar usuário ao grupo plugdev
+### Option 3: Add the user to the plugdev group
 ```bash
 sudo usermod -a -G plugdev $USER
-# Faça logout e login novamente
+# Log out and log back in
 ```
 
-## Como Usar
+## How to Use
 
-1. Conecte o fone JBL Quantum910 via USB
-2. Execute um dos scripts:
+1. Connect the JBL Quantum910 headset via USB
+2. Run one of the scripts:
    ```bash
    python3 /tmp/jbl_battery_monitor.py
-   # ou
+   # or
    python3 /tmp/jbl_battery_hidapi.py
    ```
-3. O script irá:
-   - Mostrar informações do dispositivo
-   - Monitorar continuamente a comunicação USB
-   - Tentar identificar o nível de bateria nos dados recebidos
-   - Exibir dados brutos em hexadecimal e decimal
+3. The script will:
+   - Show device information
+   - Continuously monitor the USB communication
+   - Try to identify the battery level in the received data
+   - Display raw data in hexadecimal and decimal
 
-## Interpretação dos Dados
+## Data Interpretation
 
-O script tenta várias interpretações dos dados recebidos:
-- Procura por valores entre 0-100 que podem representar porcentagem
-- Interpreta dados como 8-bit ou 16-bit
-- Procura padrões comuns de relatórios HID
+The script tries several interpretations of the received data:
+- Looks for values between 0-100 that could represent a percentage
+- Interprets data as 8-bit or 16-bit
+- Looks for common HID report patterns
 
-## Notas
+## Notes
 
-- O nível de bateria pode não ser enviado continuamente pelo dispositivo
-- Pode ser necessário usar o fone ativamente para que ele envie dados
-- O formato exato dos dados depende da implementação do fabricante
-- Alguns dispositivos só enviam informações de bateria quando solicitadas
+- The battery level may not be sent continuously by the device
+- You may need to use the headset actively for it to send data
+- The exact data format depends on the manufacturer's implementation
+- Some devices only send battery information when requested
 
 ## Troubleshooting
 
-Se o script não encontrar o dispositivo:
-- Verifique se o fone está conectado: `lsusb | grep JBL`
-- Verifique permissões: `ls -la /dev/bus/usb/001/007`
-- Tente executar como root para testar
+If the script doesn't find the device:
+- Check that the headset is connected: `lsusb | grep JBL`
+- Check permissions: `ls -la /dev/bus/usb/001/007`
+- Try running as root to test
 
-Se não receber dados:
-- O dispositivo pode não estar enviando dados continuamente
-- Tente usar o fone (reproduzir áudio, ajustar volume) para ativar comunicação
-- Alguns dispositivos requerem comandos específicos para reportar bateria
-
+If no data is received:
+- The device may not be sending data continuously
+- Try using the headset (play audio, adjust the volume) to trigger communication
+- Some devices require specific commands to report the battery

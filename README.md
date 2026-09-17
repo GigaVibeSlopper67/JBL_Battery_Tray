@@ -38,7 +38,7 @@ The confirmed battery pattern for this headset is:
 - Works for **both dongles**: Quantum 910 (`0ecb:2088`) and Quantum 810 (`0ecb:2069`). On the 810 the tray also polls the battery directly via HID feature report `0x49`, so fresh data arrives even when the headset is quiet.
 - **Mute indicator**: works on the Quantum 910 (`0x2f` mute events); the Quantum 810 does not send those, so the mic indicator simply stays inactive there.
 
-Details: `docs/PADRAO_BATERIA.md`.
+Details: `docs/BATTERY_PATTERN.md`.
 
 ## Quick Start
 
@@ -164,7 +164,7 @@ The scripts below live in `tools/` and are useful for analysis/debugging:
 See:
 
 - `docs/TROUBLESHOOTING.md`
-- `docs/INSTRUCOES.md`
+- `docs/INSTRUCTIONS.md`
 
 ## License
 
