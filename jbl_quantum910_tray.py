@@ -158,18 +158,47 @@ def parse_battery_from_packet(packet: bytes) -> Optional[int]:
 
 def parse_mute_from_packet(packet: bytes) -> Optional[tuple[bool, bool]]:
     """
-    Parse mute status from a packet (Report ID 0x2f).
-    - 0x2f 0x02 = toggle mute (button pressed) -> returns (True, True) = toggle
+    Parse mute status from a packet.
+    - 0x2f 0x02 = toggle mute (button pressed, Quantum 910) -> returns (True, True) = toggle
     - 0x2f 0x00 = unmuted state -> returns (False, False) = unmuted
+    - 0x06 0x00/0x01 = mic off/on events (Quantum 810; confirmed in the
+      HeadsetControl #357 USB captures) -> state, not a toggle.
     Returns (is_toggle, is_muted) or None if not a mute packet.
-    (The Quantum 810 does not send 0x2f mute packets, so the mute indicator
-    only works on the 910.)
     """
     if len(packet) >= 2 and packet[0] == 0x2f:
         if packet[1] == 0x02:
             return (True, True)  # Toggle - need to flip the state
         elif packet[1] == 0x00:
             return (False, False)  # Unmuted state
+    if len(packet) >= 2 and packet[0] == 0x06:
+        # Quantum 810 mic events: 0 = mic off (muted), 1 = mic on.
+        if packet[1] in (0x00, 0x01):
+            return (False, packet[1] == 0x00)
+    return None
+
+
+def parse_status_from_packet(packet: bytes) -> Optional[StatusSample]:
+    """
+    Parse extra vendor state (Quantum 810 event map, confirmed via the
+    HeadsetControl #357 captures):
+      0x02 <v>  ANC: 0=off, 1=on, 2=talk-through
+      0x07 <v>  Lights: 0=off, 1=on
+      0x10 <v>  Game/chat mix: 0x00=chat ... 0x10=game
+      0x03/0x09 Power-on markers (followed by a full state burst)
+    """
+    if len(packet) < 2:
+        return None
+    rid, b1 = packet[0], packet[1]
+    raw = " ".join(f"{b:02x}" for b in packet[:8])
+    now = time.time()
+    if rid == 0x02 and b1 in (0, 1, 2):
+        return StatusSample(anc=int(b1), source="hidraw", raw_hex=raw, ts=now)
+    if rid == 0x07 and b1 in (0, 1):
+        return StatusSample(lights=bool(b1), source="hidraw", raw_hex=raw, ts=now)
+    if rid == 0x10 and 0 <= b1 <= 16:
+        return StatusSample(mix=int(b1), source="hidraw", raw_hex=raw, ts=now)
+    if rid in (0x03, 0x09):
+        return StatusSample(power_marker=True, source="hidraw", raw_hex=raw, ts=now)
     return None
 
 
@@ -425,10 +454,44 @@ class MuteSample:
     ts: float
 
 
+@dataclass
+class StatusSample:
+    """Extra headset state from vendor event reports (Quantum 810 map)."""
+
+    anc: Optional[int] = None  # 0=off, 1=on, 2=talk-through
+    mic_muted: Optional[bool] = None
+    mix: Optional[int] = None  # 0..16, 0=full chat, 0x10=full game
+    lights: Optional[bool] = None
+    power_marker: bool = False  # 0x03/0x09 power-on markers
+    source: str = ""
+    raw_hex: str = ""
+    ts: float = 0.0
+
+    ANC_NAMES = {0: "off", 1: "on", 2: "talk-through"}
+
+    def anc_label(self) -> Optional[str]:
+        if self.anc is None:
+            return None
+        return self.ANC_NAMES.get(self.anc, f"0x{self.anc:02x}")
+
+    def mix_label(self) -> Optional[str]:
+        if self.mix is None:
+            return None
+        m = max(0, min(16, self.mix))
+        if m <= 2:
+            return f"chat ({m}/16)"
+        if m >= 14:
+            return f"game ({m}/16)"
+        return f"balanced ({m}/16)"
+
+
 class HidrawBatteryReader:
     # HIDIOCGFEATURE(len) = _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x07, len);
     # used to poll the Quantum 810 battery via feature report 0x49.
     _HIDIOCGFEATURE = (3 << 30) | (0x48 << 8) | 0x07
+    # HIDIOCSFEATURE(len) = _IOC(_IOC_WRITE|_IOC_READ, 'H', 0x06, len);
+    # used to send commands (ANC 0x46, lights 0x4b, sidetone 0x5d).
+    _HIDIOCSFEATURE = (3 << 30) | (0x48 << 8) | 0x06
 
     def __init__(self, path: str):
         self.path = path
@@ -546,16 +609,17 @@ class HidrawBatteryReader:
             return int(percent)
         return None
 
-    def poll_all(self) -> tuple[Optional[BatterySample], Optional[MuteSample]]:
-        """Poll for both battery and mute updates in a single read pass."""
+    def poll_all(self) -> tuple[Optional[BatterySample], Optional[MuteSample], Optional[StatusSample]]:
+        """Poll for battery, mute and extra status in a single read pass."""
         try:
             self._ensure_open()
         except Exception:
             self.close()
-            return None, None
+            return None, None, None
 
         last_battery: Optional[BatterySample] = None
         last_mute: Optional[MuteSample] = None
+        last_status: Optional[StatusSample] = None
         # Drain available packets (non-blocking) to get the latest updates.
         for _ in range(32):
             try:
@@ -582,16 +646,112 @@ class HidrawBatteryReader:
                         raw_hex=" ".join(f"{b:02x}" for b in data[:8]),
                         ts=time.time(),
                     )
+                # Extra state: ANC / lights / game-chat mix / power markers
+                status_info = parse_status_from_packet(data)
+                if status_info is not None:
+                    last_status = status_info
             except OSError as e:
                 if e.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
                     break
                 self.close()
-                return None, None
+                return None, None, None
             except Exception:
                 self.close()
-                return None, None
+                return None, None, None
 
-        return last_battery, last_mute
+        return last_battery, last_mute, last_status
+
+    # -- controls / extras -------------------------------------------------------
+
+    def send_feature(self, rid: int, value: int) -> bool:
+        """SET_REPORT(Feature, [rid, value]). CHANGES DEVICE STATE.
+
+        Known commands (Quantum 810, confirmed in HeadsetControl #357
+        captures): 0x46 ANC (0=off/1=on/2=talk-through), 0x4b lights,
+        0x5d sidetone (0=off/1=low/2=mid/3=high).
+        """
+        if self._fd is None:
+            try:
+                self._ensure_open()
+            except Exception:
+                return False
+        if not self._can_feature_read or self._fd is None:
+            _log("hidraw not opened read/write; cannot send feature report")
+            return False
+        buf = bytes([rid, value])
+        try:
+            fcntl.ioctl(self._fd, self._HIDIOCSFEATURE | (len(buf) << 16), buf, True)
+            return True
+        except OSError as e:
+            _log(f"SET feature 0x{rid:02x} failed on {self.path}: {e}")
+            return False
+
+    def read_feature(self, rid: int, length: int = 16) -> Optional[bytes]:
+        """GET_REPORT(Feature, rid) - read-only."""
+        if self._fd is None:
+            try:
+                self._ensure_open()
+            except Exception:
+                return None
+        if self._fd is None or not self._can_feature_read:
+            return None
+        buf = bytearray(length)
+        buf[0] = rid
+        try:
+            n = fcntl.ioctl(self._fd, self._HIDIOCGFEATURE | (length << 16), buf, True)
+        except OSError:
+            return None
+        if n and n > 0:
+            return bytes(buf[:n])
+        return None
+
+    def read_serial(self) -> Optional[str]:
+        """ASCII part/serial string from feature 0x61 (Quantum 810)."""
+        feat = self.read_feature(0x61, 32)
+        if feat and len(feat) > 2:
+            text = feat[1:].rstrip(b"\x00").decode("ascii", errors="replace").strip()
+            if text and any(c.isalnum() for c in text):
+                return text
+        return None
+
+    def read_state(self) -> Optional[StatusSample]:
+        """Read the current headset state via feature reports.
+
+        All mappings verified live (GET report id = SET id - 1):
+          0x45 -> ANC      [0x45, 0=off/1=on/2=talk-through] (mirrors SET 0x46)
+          0x4a -> lights   [0x4a, 0=off/1=on]                (mirrors SET 0x4b)
+          0x62 -> mix      [0x62, 0..16]                     (mirrors event 0x10)
+          0x67 -> mic      [0x67, 1=on, 0=muted]             (mirrors event 0x06)
+        Returns a StatusSample; individual fields stay None when a read
+        fails or the echoed report id does not match.
+        """
+        if self._fd is None:
+            try:
+                self._ensure_open()
+            except Exception:
+                return None
+        if self._fd is None or not self._can_feature_read:
+            return None
+
+        sample = StatusSample(
+            source=f"hidraw-feat:{self.path}",
+            raw_hex="features 0x45/0x67/0x4a/0x62",
+            ts=time.time(),
+        )
+        feat = self.read_feature(0x45, 2)
+        if feat and feat[0] == 0x45 and feat[1] in (0, 1, 2):
+            sample.anc = int(feat[1])
+        feat = self.read_feature(0x67, 2)
+        if feat and feat[0] == 0x67 and feat[1] in (0, 1):
+            # 0x67 mirrors event 0x06 exactly: 1 = mic on, 0 = mic off (muted).
+            sample.mic_muted = (feat[1] == 0)
+        feat = self.read_feature(0x4A, 2)
+        if feat and feat[0] == 0x4A and feat[1] in (0, 1):
+            sample.lights = (feat[1] == 1)
+        feat = self.read_feature(0x62, 2)
+        if feat and feat[0] == 0x62 and 0 <= feat[1] <= 16:
+            sample.mix = int(feat[1])
+        return sample
 
 
 class PyUsbBatteryReader:
@@ -784,7 +944,7 @@ class PyUsbBatteryReader:
 
 
 class BatteryTrayApp:
-    def __init__(self, refresh_seconds: float, prefer_pyusb: bool, pyusb_detach: bool, numeric_icon: bool = False):
+    def __init__(self, refresh_seconds: float, prefer_pyusb: bool, pyusb_detach: bool, numeric_icon: bool = False, enable_controls: bool = False):
         self.refresh_seconds = max(0.2, refresh_seconds)
         self.prefer_pyusb = prefer_pyusb
 
@@ -792,10 +952,21 @@ class BatteryTrayApp:
 
         self.last_sample: Optional[BatterySample] = None
         self.last_mute_sample: Optional[MuteSample] = None
+        self.last_status_sample: Optional[StatusSample] = None
         self._last_label: Optional[str] = None
         self._last_logged_error: Optional[str] = None
         self._last_logged_percent: Optional[int] = None
         self._is_muted: bool = False
+
+        # Extra headset state (Quantum 810 event map):
+        self.enable_controls: bool = enable_controls
+        self._anc: Optional[int] = None        # 0=off, 1=on, 2=talk-through
+        self._mix: Optional[int] = None        # 0..16
+        self._lights_on: Optional[bool] = None
+        self._serial: Optional[str] = None
+        self._serial_tried: bool = False
+        self._last_logged_anc: Optional[int] = None
+        self._last_logged_mix: Optional[int] = None
 
         self.hidraw_reader: Optional[HidrawBatteryReader] = None
         # Keep `pyusb_detach` for CLI compatibility, but the default behavior
@@ -876,9 +1047,48 @@ class BatteryTrayApp:
         self._status_item.set_sensitive(False)
         menu.append(self._status_item)
 
+        # Extra headset state (Quantum 810 event map):
+        self._menu_anc_item = self.Gtk.MenuItem(label="ANC: --")
+        self._menu_anc_item.set_sensitive(False)
+        menu.append(self._menu_anc_item)
+
+        self._menu_mic_item = self.Gtk.MenuItem(label="Microphone: --")
+        self._menu_mic_item.set_sensitive(False)
+        menu.append(self._menu_mic_item)
+
+        self._menu_mix_item = self.Gtk.MenuItem(label="Game/Chat: --")
+        self._menu_mix_item.set_sensitive(False)
+        menu.append(self._menu_mix_item)
+
+        self._menu_serial_item = self.Gtk.MenuItem(label="Serial: --")
+        self._menu_serial_item.set_sensitive(False)
+        menu.append(self._menu_serial_item)
+
         item_refresh = self.Gtk.MenuItem(label="Refresh now")
         item_refresh.connect("activate", lambda *_: self._force_refresh())
         menu.append(item_refresh)
+
+        if self.enable_controls:
+            # State-changing controls (opt-in via --enable-controls).
+            ctrl_sep = self.Gtk.SeparatorMenuItem()
+            menu.append(ctrl_sep)
+
+            anc_item = self.Gtk.MenuItem(label="Cycle ANC (off -> on -> talk-through)")
+            anc_item.connect("activate", lambda *_: self._cycle_anc())
+            menu.append(anc_item)
+
+            lights_item = self.Gtk.MenuItem(label="Toggle lights")
+            lights_item.connect("activate", lambda *_: self._toggle_lights())
+            menu.append(lights_item)
+
+            sidetone_menu = self.Gtk.Menu()
+            for level in ("off", "low", "mid", "high"):
+                sub = self.Gtk.MenuItem(label=f"Sidetone: {level}")
+                sub.connect("activate", lambda _w, lv=level: self._set_sidetone(lv))
+                sidetone_menu.append(sub)
+            sidetone_item = self.Gtk.MenuItem(label="Sidetone")
+            sidetone_item.set_submenu(sidetone_menu)
+            menu.append(sidetone_item)
 
         item_sep = self.Gtk.SeparatorMenuItem()
         menu.append(item_sep)
@@ -889,6 +1099,33 @@ class BatteryTrayApp:
 
         menu.show_all()
         return menu
+
+    # -- controls (only wired up with --enable-controls) -------------------------
+
+    def _cycle_anc(self) -> None:
+        if self.hidraw_reader is None:
+            return
+        nxt = 1 if self._anc is None else (self._anc + 1) % 3
+        if self.hidraw_reader.send_feature(0x46, nxt):
+            self._anc = nxt
+            _log(f"ANC set to {StatusSample.ANC_NAMES.get(nxt, nxt)} (feature 0x46)")
+            self._render()
+
+    def _toggle_lights(self) -> None:
+        if self.hidraw_reader is None:
+            return
+        new_state = not (self._lights_on or False)
+        if self.hidraw_reader.send_feature(0x4B, 1 if new_state else 0):
+            self._lights_on = new_state
+            _log(f"Lights {'on' if new_state else 'off'} (feature 0x4b)")
+            self._render()
+
+    def _set_sidetone(self, level: str) -> None:
+        values = {"off": 0, "low": 1, "mid": 2, "high": 3}
+        if self.hidraw_reader is None:
+            return
+        if self.hidraw_reader.send_feature(0x5D, values[level]):
+            _log(f"Sidetone set to {level} (feature 0x5d)")
 
     def _quit(self):
         try:
@@ -961,18 +1198,26 @@ class BatteryTrayApp:
         else:
             readers = [("hidraw", (self.hidraw_reader.poll if self.hidraw_reader else None)), ("pyusb", self.pyusb_reader.poll)]
 
-        for _, fn in readers:
+        for name, fn in readers:
             if fn is None:
                 continue
-            sample = fn()
-            if sample is not None:
-                return sample
+            # Never fall back to pyusb while the hidraw reader is attached:
+            # claiming the USB interface via pyusb detaches the kernel driver
+            # and destroys the hidraw node until the dongle is replugged.
+            if name == "pyusb" and self.hidraw_reader is not None:
+                continue
+            try:
+                sample = fn()
+                if sample is not None:
+                    return sample
+            except Exception:
+                continue
         return None
 
-    def _read_all_once(self) -> tuple[Optional[BatterySample], Optional[MuteSample]]:
-        """Read both battery and mute status from device."""
+    def _read_all_once(self) -> tuple[Optional[BatterySample], Optional[MuteSample], Optional[StatusSample]]:
+        """Read battery, mute and extra status from device."""
         # Priority: read battery using poll (original method that worked)
-        # Then try to read mute separately if needed
+        # Then try to read mute/status separately if needed
         readers = []
         if self.prefer_pyusb:
             readers = [("pyusb", self.pyusb_reader.poll), ("hidraw", (self.hidraw_reader.poll if self.hidraw_reader else None))]
@@ -990,23 +1235,28 @@ class BatteryTrayApp:
             except Exception:
                 continue
         
-        # Try to read mute using poll_all (non-blocking, won't interfere if no data)
+        # Try to read mute + status using poll_all (non-blocking, won't interfere if no data)
         mute_sample = None
+        status_sample = None
         try:
-            # Only try hidraw for mute (less intrusive)
+            # Only try hidraw for mute/status (less intrusive)
             if self.hidraw_reader:
                 try:
-                    _, mute = self.hidraw_reader.poll_all()
+                    _, mute, status = self.hidraw_reader.poll_all()
                     if mute is not None:
                         mute_sample = mute
+                    if status is not None:
+                        status_sample = status
                 except Exception:
                     pass
             # Also try pyusb poll_all, but only without hidraw: claiming the
             # USB interface detaches the kernel driver, which destroys the
             # hidraw node that the (preferred) hidraw reader needs.
+            # NOTE: never claim pyusb while a hidraw node exists - that is
+            # what used to make the hidraw node disappear until replug.
             if mute_sample is None and self.hidraw_reader is None:
                 try:
-                    _, mute = self.pyusb_reader.poll_all()
+                    _, mute, _ = self.pyusb_reader.poll_all()
                     if mute is not None:
                         mute_sample = mute
                 except Exception:
@@ -1014,20 +1264,68 @@ class BatteryTrayApp:
         except Exception:
             pass
         
-        return battery_sample, mute_sample
+        return battery_sample, mute_sample, status_sample
+
+    def _apply_status(self, status_sample: StatusSample) -> bool:
+        """Fold a status sample (event or feature read-back) into app state.
+
+        Returns True when something changed and a re-render is needed.
+        """
+        needs_render = False
+        if status_sample.anc is not None and status_sample.anc != self._anc:
+            self._anc = status_sample.anc
+            if self._last_logged_anc != self._anc:
+                _log(f"ANC: {StatusSample.ANC_NAMES.get(self._anc, self._anc)} (source={status_sample.source})")
+                self._last_logged_anc = self._anc
+            needs_render = True
+        if status_sample.mix is not None and status_sample.mix != self._mix:
+            self._mix = status_sample.mix
+            if self._last_logged_mix != self._mix:
+                _log(f"Game/Chat mix: {self._mix}/16 (source={status_sample.source})")
+                self._last_logged_mix = self._mix
+            needs_render = True
+        if status_sample.lights is not None:
+            self._lights_on = status_sample.lights
+        if status_sample.mic_muted is not None:
+            # Make the mic state visible in the menu as soon as we know it.
+            if self.last_mute_sample is None:
+                self.last_mute_sample = MuteSample(
+                    is_toggle=False,
+                    muted=status_sample.mic_muted,
+                    source=status_sample.source,
+                    raw_hex=status_sample.raw_hex,
+                    ts=status_sample.ts,
+                )
+            if status_sample.mic_muted != self._is_muted:
+                self._is_muted = status_sample.mic_muted
+                _log(f"Microphone {'MUTED' if self._is_muted else 'on'} (source={status_sample.source})")
+                needs_render = True
+        if (status_sample.anc is not None or status_sample.mix is not None
+                or status_sample.lights is not None or status_sample.mic_muted is not None):
+            self.last_status_sample = status_sample
+        return needs_render
 
     def _force_refresh(self):
-        sample = self._read_once()
+        sample, _mute, status = self._read_all_once()
         if sample is not None:
             self.last_sample = sample
+        if status is not None:
+            self._apply_status(status)
+        if self.hidraw_reader is not None:
+            try:
+                state_sample = self.hidraw_reader.read_state()
+                if state_sample is not None:
+                    self._apply_status(state_sample)
+            except Exception:
+                pass
         self._render()
 
     def _tick(self):
         # Pick up a hidraw node that appeared after startup (e.g. after the
         # dongle was replugged following a pyusb session).
         self._rescan_hidraw()
-        # Read both battery and mute in a single pass
-        battery_sample, mute_sample = self._read_all_once()
+        # Read battery, mute and extra status in a single pass
+        battery_sample, mute_sample, status_sample = self._read_all_once()
         
         needs_render = False
         
@@ -1058,14 +1356,42 @@ class BatteryTrayApp:
                 emoji = "🔇" if self._is_muted else "🎤"
                 _log(f"Microphone {emoji} {status} (toggle detected, source={mute_sample.source}, data={mute_sample.raw_hex})")
             else:
-                # 0x2f 0x00 = unmuted state
-                self._is_muted = False
-                _log(f"Microphone 🎤 UNMUTED (state received, source={mute_sample.source}, data={mute_sample.raw_hex})")
+                # 0x2f 0x00 = unmuted state, or 0x06 0x00/0x01 mic state (810)
+                self._is_muted = bool(mute_sample.muted)
+                status = "MUTED" if self._is_muted else "UNMUTED"
+                _log(f"Microphone {'🔇' if self._is_muted else '🎤'} {status} (state received, source={mute_sample.source}, data={mute_sample.raw_hex})")
             
             # Force render if mute state changed
             if old_muted != self._is_muted:
                 needs_render = True
         
+        if status_sample is not None:
+            if self._apply_status(status_sample):
+                needs_render = True
+        
+        # Read back the current state via feature reports (0x45/0x67/0x4a/0x62).
+        # This fills in ANC/mic/mix/lights immediately after startup even when
+        # the headset sends no events, and keeps them fresh if an event was
+        # missed (e.g. the tray started while the headset was already on).
+        if self.hidraw_reader is not None:
+            try:
+                state_sample = self.hidraw_reader.read_state()
+                if state_sample is not None:
+                    if self._apply_status(state_sample):
+                        needs_render = True
+            except Exception:
+                pass
+        
+        # Serial string: try once per hidraw reader lifetime (810 only).
+        if not self._serial_tried and self.hidraw_reader is not None:
+            self._serial_tried = True
+            try:
+                self._serial = self.hidraw_reader.read_serial()
+                if self._serial:
+                    _log(f"Device serial/part number: {self._serial}")
+                    needs_render = True
+            except Exception:
+                pass
         # Always render, but force update if something changed
         if needs_render or (battery_sample is not None and self._last_label == "--%"):
             self._last_label = None  # Force label update
@@ -1134,11 +1460,41 @@ class BatteryTrayApp:
                 _log(f"Error updating label: {e}")
                 pass
 
+        # Menu items for the extra headset state (ANC / mic / mix / serial)
+        try:
+            if getattr(self, "_menu_anc_item", None) is not None:
+                anc_label = StatusSample.ANC_NAMES.get(self._anc, None) if self._anc is not None else None
+                self._menu_anc_item.set_label(f"ANC: {anc_label or '--'}")
+            if getattr(self, "_menu_mic_item", None) is not None:
+                # Show mic state only once we have received any mute/mic event:
+                if self.last_mute_sample is not None:
+                    mic = "muted" if self._is_muted else "on"
+                else:
+                    mic = "--"
+                self._menu_mic_item.set_label(f"Microphone: {mic}")
+            if getattr(self, "_menu_mix_item", None) is not None:
+                tmp = StatusSample(mix=self._mix)
+                self._menu_mix_item.set_label(f"Game/Chat: {tmp.mix_label() or '--'}")
+            if getattr(self, "_menu_serial_item", None) is not None:
+                self._menu_serial_item.set_label(f"Serial: {self._serial or '--'}")
+        except Exception:
+            pass
+
         # Tooltip with freshness + source + mute status
         if self.last_sample:
             age_s = max(0.0, time.time() - self.last_sample.ts)
             mute_status = "🔇 MUTED" if self._is_muted else "🎤 Active"
-            tip = f"{self._model_name}: {self.last_sample.percent}%\nMicrophone: {mute_status}\nSource: {self.last_sample.source}\nUpdated: {age_s:.0f}s ago\nData: {self.last_sample.raw_hex}"
+            anc_status = StatusSample.ANC_NAMES.get(self._anc, "--") if self._anc is not None else "--"
+            mix_status = StatusSample(mix=self._mix).mix_label() or "--"
+            serial_status = self._serial or "--"
+            tip = (f"{self._model_name}: {self.last_sample.percent}%\n"
+                   f"Microphone: {mute_status}\n"
+                   f"ANC: {anc_status}\n"
+                   f"Game/Chat mix: {mix_status}\n"
+                   f"Serial: {serial_status}\n"
+                   f"Source: {self.last_sample.source}\n"
+                   f"Updated: {age_s:.0f}s ago\n"
+                   f"Data: {self.last_sample.raw_hex}")
         else:
             src = "hidraw" if self.hidraw_reader else "pyusb"
             extra = ""
@@ -1195,6 +1551,12 @@ def main() -> int:
         action="store_true",
         help="(compat) Native themed battery icons (now the default)",
     )
+    parser.add_argument(
+        "--enable-controls",
+        action="store_true",
+        help="Add headset controls to the menu (ANC cycle, lights toggle, "
+        "sidetone). These CHANGE device state via HID feature reports.",
+    )
     args = parser.parse_args()
 
     app = BatteryTrayApp(
@@ -1202,6 +1564,7 @@ def main() -> int:
         prefer_pyusb=(not args.prefer_hidraw),
         pyusb_detach=args.pyusb_detach_kernel,
         numeric_icon=(args.numeric_icon and not args.no_numeric_icon),
+        enable_controls=args.enable_controls,
     )
     app.run()
     return 0

@@ -15,6 +15,8 @@ The confirmed battery pattern for this headset is:
 
 - **Tray/AppIndicator**: shows the battery % in the tray and updates automatically.
 - **Reading**: hidraw first (works for both models), pyusb as fallback. On the Quantum 810 the battery is actively polled via HID feature report `0x49`, so it stays fresh even when the headset is quiet.
+- **Extra headset status (810)**: the tray and CLI also show **ANC state**, **mic mute**, the **game/chat dial position** and the device **part/serial number** - see `docs/HID_REPORTS.md`.
+- **Controls (opt-in)**: with `jbl_quantum910_tray.py --enable-controls` the tray menu can **cycle ANC**, **toggle the lights** and **set the sidetone** via HID feature reports (`0x46`/`0x4b`/`0x5d`).
 - **Permission helper**: `check_permissions.sh` verifies your hidraw access; `setup_udev_rules.sh` installs the udev rules (`uaccess` + `0666` — no plugdev group or usermod needed).
 - **Login service**: installs as `systemd --user` (no need for root to run the app).
 - **Tools and docs**: analysis scripts and documentation were organized into folders.
@@ -36,9 +38,9 @@ The confirmed battery pattern for this headset is:
 - **Byte 0**: Report ID = `0x08`
 - **Byte 1**: battery in % (0–100)
 - Works for **both dongles**: Quantum 910 (`0ecb:2088`) and Quantum 810 (`0ecb:2069`). On the 810 the tray also polls the battery directly via HID feature report `0x49`, so fresh data arrives even when the headset is quiet.
-- **Mute indicator**: works on the Quantum 910 (`0x2f` mute events); the Quantum 810 does not send those, so the mic indicator simply stays inactive there.
+- **Mute indicator**: works on the Quantum 910 (`0x2f` mute events) **and on the Quantum 810** (`0x06` mic on/off events - previously believed to be 910-only).
 
-Details: `docs/BATTERY_PATTERN.md`.
+Details: `docs/BATTERY_PATTERN.md` and the full protocol map in `docs/HID_REPORTS.md`.
 
 ## Quick Start
 
@@ -143,6 +145,8 @@ chmod +x ./uninstall.sh
 
 The scripts below live in `tools/` and are useful for analysis/debugging:
 
+- `tools/jbl_status.py`: **full status reader** (battery, ANC, mic, game/chat mix, serial) with `--json`, `--watch` and control flags (`--set-anc`, `--set-lights`, `--set-sidetone`)
+- `tools/jbl_status_probe.py`: **live protocol probe** (`--monitor` decodes event packets, `--features` watches feature reports, `--scan` sweeps all report IDs, `--correlate` guides you through verifying each action)
 - `tools/jbl_battery_auto.py`: auto-detects the dongle (910/810) and monitors the battery
 - `tools/jbl_battery_hidraw.py`: full dump/analysis (has `--log`)
 - `tools/jbl_battery_monitor.py`: alternative via pyusb
@@ -155,8 +159,10 @@ The scripts below live in `tools/` and are useful for analysis/debugging:
 
 - **IDs**: Quantum 910 `0ecb:2088` / Quantum 810 `0ecb:2069`
 - **HID**: interface 3 (Quantum 910) / interface 5 (Quantum 810), IN endpoint (used by the `pyusb` method)
-- **Updates**: on the Quantum 910 the headset can go “quiet” — use the volume/buttons to generate traffic. On the Quantum 810 the tray polls the battery directly, so it always stays fresh.
-- **Mute**: the tray mute icon works on the Quantum 910 (`0x2f` mute events); the Quantum 810 does not send those, so the mic indicator stays inactive there.
+- **Updates**: on the Quantum 910 the headset can go "quiet" — use the volume/buttons to generate traffic. On the Quantum 810 the tray polls the battery directly, so it always stays fresh.
+- **Mute**: works on both models — Quantum 910 via `0x2f` events, Quantum 810 via `0x06` mic on/off events.
+- **Controls**: ANC/lights/sidetone commands change device state; in the tray they are only active with `--enable-controls`, in the CLI only via the explicit `--set-*` flags.
+- **hidraw safety**: never run a pyusb session against the vendor interface while the hidraw node exists — claiming the interface removes the hidraw node until the dongle is replugged (the tray now avoids this, but the older CLI tools can still trigger it).
 - **Permissions**: run `sudo ./setup_udev_rules.sh` once — it installs rules with `uaccess` + `0666`, so no plugdev group or usermod is needed. Then replug the dongle.
 
 ## Troubleshooting
