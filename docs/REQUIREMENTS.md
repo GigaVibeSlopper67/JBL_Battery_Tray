@@ -1,5 +1,30 @@
 # Requirements and Installation
 
+## Tray / AppIndicator (system packages, not pip)
+
+The tray needs PyGObject + GTK3 + an AppIndicator implementation, and
+libnotify for the desktop notifications. Install via the package manager:
+
+```bash
+# Debian/Ubuntu:
+sudo apt install -y python3-gi gir1.2-gtk-3.0 gir1.2-ayatanaappindicator3-0.1 \
+    gir1.2-notify-0.7
+# (on some distros the AppIndicator package is: gir1.2-appindicator3-0.1)
+
+# Fedora:
+sudo dnf install -y python3-gobject gtk3 libayatana-appindicator-gtk3 libnotify
+
+# RHEL / CentOS Stream / Rocky / AlmaLinux (EPEL):
+sudo dnf install -y epel-release
+sudo dnf install -y python3-gobject gtk3 libayatana-appindicator-gtk3 libnotify
+```
+
+Without libnotify the tray still runs - it just skips the desktop
+notifications (low battery, dongle connect/disconnect).
+
+`requirements.txt` (`pyusb`, `hidapi`) is only needed by the CLI analysis
+scripts; the tray itself reads via hidraw and needs **no pip packages**.
+
 ## Required Python Libraries
 
 ### For `jbl_battery_monitor.py` (pyusb)

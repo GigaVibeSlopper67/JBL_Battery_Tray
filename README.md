@@ -4,10 +4,12 @@ Attention Attention! This is AI Chudslop, use at own risk xD
 
 **Real** battery monitor for the JBL Quantum910 and Quantum810: shows the **battery % in the tray** and can start automatically at login via **`systemd --user`**.
 
-Experimental Features:
-- RGB control (has some bugs)
-- Control Sidetone
-- Cycle ANC
+Experimental controls (opt-in, **they change device state**):
+- **RGB lighting** - logo + ring color (breathing-style effect) via the tray
+  color picker/presets or the `tools/jbl_rgb.py` CLI (see "RGB lighting" below)
+- **Cycle ANC** (off -> on -> talk-through)
+- **Lights on/off** toggle
+- **Sidetone level** (off/low/mid/high)
 
 The confirmed battery pattern for this headset is:
 
@@ -21,7 +23,7 @@ The confirmed battery pattern for this headset is:
 - **Tray/AppIndicator**: shows the battery % in the tray and updates automatically.
 - **Reading**: hidraw first (works for both models), pyusb as fallback. On the Quantum 810 the battery is actively polled via HID feature report `0x49`, so it stays fresh even when the headset is quiet.
 - **Extra headset status (810)**: the tray and CLI also show **ANC state**, **mic mute**, the **game/chat dial position** and the device **part/serial number** - see `docs/HID_REPORTS.md`.
-- **Controls (opt-in)**: with `jbl_quantum910_tray.py --enable-controls` the tray menu can **cycle ANC**, **toggle the lights**, **set the sidetone** and **set the lighting color** (logo + ring elements, breathing effect) via HID feature reports (`0x46`/`0x4b`/`0x5d`/`0x4c`+`0x4d`) - see `docs/HID_REPORTS.md`.
+- **Controls (opt-in)**: with `jbl_quantum910_tray.py --enable-controls` the tray menu can **cycle ANC**, **toggle the lights**, **set the sidetone** (radio items marking the level read back via `0x5c`) and **set the lighting color** (logo + ring elements, breathing effect; "Lighting" submenu with a GTK color picker + presets) via HID feature reports (`0x46`/`0x4b`/`0x5d`/`0x4c`+`0x4d`) - see `docs/HID_REPORTS.md`.
 - **Lights/sidetone state**: the tray reads back and shows the current **lights state** (`0x4a`) and **sidetone level** (`0x5c`) in the menu/tooltip; the sidetone submenu marks the active level.
 - **Notifications**: desktop notifications on **low battery** (20/10/5%) and **dongle connect/disconnect**; mute notifications opt-in via `--notify-mute`; everything off with `--no-notifications`.
 - **Battery history & estimate**: every percentage change is appended to `~/.local/share/jbl-quantum-tray/history.csv`; the tray computes the drain rate and shows an **estimated runtime left** in the menu/tooltip (needs ~5 minutes of data).
@@ -133,6 +135,7 @@ python3 ./jbl_quantum910_tray.py --refresh 1.0
 python3 ./jbl_quantum910_tray.py --prefer-hidraw  # recommended for the Quantum 810
 python3 ./jbl_quantum910_tray.py --no-notifications  # disable desktop notifications
 python3 ./jbl_quantum910_tray.py --notify-mute      # also notify on mute changes
+python3 ./jbl_quantum910_tray.py --enable-controls  # menu controls: ANC/lights/sidetone/RGB
 ```
 
 ## Installation (recommended) — starts with the system (login)
@@ -152,12 +155,53 @@ chmod +x ./uninstall.sh
 ./uninstall.sh
 ```
 
+## RGB lighting (experimental)
+
+The Quantum 810's lighting (logo + earcup ring) can be controlled from Linux
+via HID feature reports (`0x4c`/`0x4d` color table + `0x4b` commit). The
+protocol was decoded from QuantumENGINE USB captures and verified live on a
+Quantum 810 - full protocol map: `docs/HID_REPORTS.md` ("Lighting (RGB)").
+
+Verified behavior:
+
+- A solid color is written as **5 identical segments per element** and renders
+  as a **breathing-style pulse** (the steady "Solid" effect encoding is still
+  unknown).
+- Lighting SETs are ignored unless the dongle is **armed** first (the
+  QuantumENGINE connect-time GET round - both the tray and the CLI do this
+  automatically). The armed state persists for several minutes.
+- The table applies on the **lights off -> on transition**; the tray and CLI
+  switch the lights off, write the table and switch them back on.
+- There is **no read-back** for the color table; colors persist until
+  overwritten. `--default` replays the factory teal table (`33 ff cc`),
+  QuantumENGINE on Windows can always restore them.
+
+In the tray (with `--enable-controls`): menu -> **Lighting -> Pick color…**
+(GTK color chooser) or the presets **Red / Green / Blue / White / Teal (factory)**.
+
+CLI (`tools/jbl_rgb.py`):
+
+```bash
+python3 tools/jbl_rgb.py --status                  # read-only probe
+python3 tools/jbl_rgb.py --solid ff0000 --lights on          # red, breathing effect
+python3 tools/jbl_rgb.py --solid 00ffcc --element logo       # only the logo
+python3 tools/jbl_rgb.py --solid ff8800 --speed 0x32 --mode 0x05  # tempo/M-byte experiments
+python3 tools/jbl_rgb.py --default --lights off    # factory teal + lights off
+python3 tools/jbl_rgb.py --raw "4c 00 64 05;4d 00 00 ff 00 00 02 00"  # raw feature reports
+```
+
+Options: `--element logo|ring|both` (verified: element 0 = logo, 1 = ring),
+`--speed` (0x4c tempo byte, default `0x64`), `--mode` (0x4d interval marker,
+default `0x02` logo / `0x05` ring), `--lights on|off|keep` (state after the
+write, default `keep`) and `--listen SEC` (seconds to listen for `0x07` ACK
+events after a write).
+
 ## Tools (helper scripts)
 
 The scripts below live in `tools/` and are useful for analysis/debugging:
 
 - `tools/jbl_status.py`: **full status reader** (battery, ANC, mic, game/chat mix, serial) with `--json`, `--watch` and control flags (`--set-anc`, `--set-lights`, `--set-sidetone`)
-- `tools/jbl_rgb.py`: **RGB lighting CLI** - `--status` (read-only probe), `--solid RRGGBB [--element logo|ring|both]`, `--default` (factory table), `--raw` hex sequences; performs the arming GET round automatically
+- `tools/jbl_rgb.py`: **RGB lighting CLI** - `--status` (read-only probe), `--solid RRGGBB [--element logo|ring|both]`, `--default` (factory teal table), `--raw` hex sequences, `--speed`/`--mode` (0x4c tempo / 0x4d M-byte overrides), `--lights on|off|keep`, `--listen SEC`; performs the arming GET round automatically
 - `tools/jbl_status_probe.py`: **live protocol probe** (`--monitor` decodes event packets, `--features` watches feature reports, `--scan` sweeps all report IDs, `--correlate` guides you through verifying each action)
 - `tools/jbl_battery_auto.py`: auto-detects the dongle (910/810) and monitors the battery
 - `tools/jbl_battery_hidraw.py`: full dump/analysis (has `--log`)

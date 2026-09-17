@@ -103,7 +103,9 @@ Verified behavior (live on a Quantum 810 via hidraw):
 
 - **Arming required**: the lighting SETs only take effect after the
   QuantumENGINE connect-time GET round (`0x50, 0x68, 0x51, 0x45, 0x67,
-  0x5c, 0x62, 0x49, 0x47, 0x4a, 0x5b` in that order). Without it the dongle
+  0x68, 0x5c, 0x62, 0x49, 0x47, 0x4a, 0x5b` in that order; `0x68` is
+  requested twice - this exact round is used by the tray and
+  `tools/jbl_rgb.py`). Without it the dongle
   still accepts and caches the SETs - the `0x4a` read-back even flips! -
   but the headset ignores them (no LED change, no `07` event). Arming
   persists for at least several minutes.
@@ -132,6 +134,27 @@ Open questions (not yet decoded):
   queue rather than a fixed table.
 - The minimal arming GET (the full round is used as the safe recipe).
 
+### Controlling the lighting from Linux
+
+Both implementations arm automatically (the 12-request GET round above),
+then write the per-element table and toggle the lights to trigger the
+off->on apply cycle:
+
+- **Tray** (`--enable-controls`): menu -> Lighting -> "Pick color…" (GTK
+  color chooser) or the presets Red/Green/Blue/White/Teal (factory).
+  Applies one color to both elements (logo + ring).
+- **CLI** `tools/jbl_rgb.py`:
+  - `--status` - read-only probe (state + `0x4c`/`0x4d`/`0x4e` GET attempts)
+  - `--solid RRGGBB [--element logo|ring|both]` - one color as 5 identical
+    segments (breathing-style effect)
+  - `--default` - replay the factory teal table (`33 ff cc`, tempo `0x64`)
+  - `--speed N` - override the `0x4c` tempo byte (default `0x64`; captures
+    also show `0x32`)
+  - `--mode N` - override the `0x4d` M byte (default `0x02` logo / `0x05` ring)
+  - `--lights on|off|keep` - lights state after the write (default `keep`)
+  - `--listen SEC` - seconds to listen for `0x07` ACK events after a SET
+  - `--raw "4c 00 64 05;4d 00 00 ff 00 00 02 00"` - send raw feature reports
+
 ## What is NOT (yet) monitorable
 
 - **Charging state**: verified empirically - while the headset was charging
@@ -149,9 +172,11 @@ Open questions (not yet decoded):
   `--set-anc`, `--set-lights`, `--set-sidetone`)
 - `tools/jbl_rgb.py` - RGB lighting CLI (`--status` read-only probe,
   `--solid RRGGBB [--element logo|ring|both]`, `--default` factory table,
-  `--raw` hex sequences; arms automatically before writes)
+  `--raw` hex sequences, `--speed`/`--mode` tuning overrides,
+  `--lights on|off|keep`, `--listen SEC`; arms automatically before writes)
 - `tools/jbl_status_probe.py` - live protocol probe (`--monitor`, `--features`,
   `--scan`, `--correlate`)
 - `jbl_quantum910_tray.py` - tray shows ANC/mic/mix/lights/sidetone/serial
-  plus a battery drain estimate; menu controls behind `--enable-controls`,
-  including a Lighting color picker (breathing effect)
+  plus a battery drain estimate; menu controls behind `--enable-controls`
+  (ANC cycle, lights toggle, sidetone radio group) including a **Lighting**
+  submenu with a color picker and presets (breathing effect)
