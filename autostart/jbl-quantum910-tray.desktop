@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=JBL Quantum910 Battery Tray
+Comment=Shows the JBL Quantum 910/810 battery % in the tray
+Exec=sh -lc "$HOME/.local/bin/jbl-quantum910-tray"
+Terminal=false
+Categories=Utility;
+X-GNOME-Autostart-enabled=true
+
