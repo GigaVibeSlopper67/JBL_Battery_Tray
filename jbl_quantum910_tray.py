@@ -8,6 +8,13 @@ JBL Quantum 910/810 - Tray Battery Monitor (Linux)
 - Supports both dongles: JBL Quantum 910 (0ecb:2088) and JBL Quantum 810
   (0ecb:2069). On the 810 the battery can also be polled directly via the
   HID feature report 0x49, so no traffic from the headset is needed.
+- Shows extra 810 headset state (ANC, mic mute, game/chat mix, lights,
+  sidetone, serial) read back via feature reports on every refresh.
+- Desktop notifications: low battery (20/10/5%) and dongle
+  connect/disconnect; mute notifications opt-in via --notify-mute;
+  everything off with --no-notifications.
+- Battery history (CSV) + estimated runtime left computed from the
+  battery drain rate.
 
 Battery format confirmed in this repo (same for both models):
   [Report ID, Battery%] => 0x08 <0..100>
@@ -43,6 +50,26 @@ PRODUCT_ID = 0x2088  # Quantum 910 (kept for backwards compatibility)
 BATTERY_FEATURE_REPORT_ID = 0x49
 # Directory for the generated numeric badge icons (percentage drawn into the tray icon).
 ICON_DIR = os.path.expanduser("~/.cache/jbl-quantum-tray/icons")
+# Battery history log (CSV, appended on every percentage change). Used for
+# the drain-rate estimate shown in the menu and tooltip.
+HISTORY_DIR = os.path.expanduser("~/.local/share/jbl-quantum-tray")
+HISTORY_CSV = os.path.join(HISTORY_DIR, "history.csv")
+# Low-battery notification thresholds in percent. Each threshold fires one
+# desktop notification when crossed downward and re-arms once the battery
+# has recovered 3% above it (e.g. after recharging).
+LOW_BATTERY_LEVELS = (20, 10, 5)
+# --- Lighting (RGB) feature reports (Quantum 810, verified live) ----------------
+# The lighting SETs only take effect after the QuantumENGINE connect-time
+# GET round ("arming"): without it the dongle caches the SETs but the
+# headset ignores them. Arming persists for at least several minutes.
+LIGHT_ARM_GET_RIDS = (0x50, 0x68, 0x51, 0x45, 0x67, 0x68, 0x5C, 0x62,
+                      0x49, 0x47, 0x4A, 0x5B)
+FEAT_LIGHT_HEADER = 0x4C  # SET: [0x4c, element, tempo, segments]
+FEAT_LIGHT_FRAME = 0x4D  # SET: [0x4d, element, index, R, G, B, M, index*2]
+LIGHT_ELEMENTS = (0, 1)  # element 0 = logo, element 1 = ring (verified live)
+LIGHT_SEGMENTS = 5       # color segments per element (QuantumENGINE default)
+LIGHT_TEMPO = 0x64       # tempo byte (0x32/0x64 observed = slider value)
+LIGHT_MODES = {0: 0x02, 1: 0x05}  # per-segment interval marker (M byte)
 
 
 def _import_appindicator():
@@ -202,10 +229,91 @@ def parse_status_from_packet(packet: bytes) -> Optional[StatusSample]:
     return None
 
 
+def build_lighting_reports(color: tuple, element: int = 0, tempo: int = LIGHT_TEMPO,
+                           mode: Optional[int] = None,
+                           segments: int = LIGHT_SEGMENTS) -> list:
+    """Feature reports that write one color to a lighting element.
+
+    Decoded from the HeadsetControl #357 USB captures and verified live on
+    a Quantum 810 (see docs/HID_REPORTS.md). A color is expressed as
+    `segments` identical frames; the headset renders it with its
+    breathing-style effect (QuantumENGINE distributes colors over tempo
+    intervals). Element 0 = logo, 1 = ring.
+
+    Returns the report payloads in send order: one 0x4c header followed by
+    `segments` 0x4d frames. The sequence only takes effect after the
+    LIGHT_ARM_GET_RIDS GET round and a lights off->on transition.
+    """
+    r, g, b = color
+    if mode is None:
+        mode = LIGHT_MODES.get(element, 0x02)
+    reports = [bytes([FEAT_LIGHT_HEADER, element, tempo, segments])]
+    for i in range(segments):
+        reports.append(bytes([FEAT_LIGHT_FRAME, element, i, r, g, b, mode, i * 2]))
+    return reports
+
+
 def _log(msg: str) -> None:
     # Journald/systemd friendly: timestamp + flush
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
+
+
+# --- Desktop notifications -----------------------------------------------------
+
+
+class Notifier:
+    """Desktop notifications via libnotify (GObject), notify-send fallback.
+
+    Passive-only: notifications never change device state. Degrades to a
+    no-op (with a single log line) when neither libnotify nor notify-send
+    is available.
+    """
+
+    def __init__(self, app_name: str, enabled: bool = True):
+        self.enabled = enabled
+        self._app_name = app_name
+        self._notify = None  # gi.repository.Notify when available
+        self._fallback_ok: Optional[bool] = None  # None = notify-send not tried yet
+        if not enabled:
+            return
+        try:
+            import gi  # type: ignore
+
+            gi.require_version("Notify", "0.7")
+            from gi.repository import Notify  # type: ignore
+
+            if Notify.init(app_name):
+                self._notify = Notify
+        except Exception:
+            self._notify = None  # try the notify-send CLI later
+
+    def send(self, summary: str, body: str = "", icon: str = "battery-caution-symbolic") -> bool:
+        if not self.enabled:
+            return False
+        if self._notify is not None:
+            try:
+                self._notify.Notification.new(summary, body, icon).show()
+                return True
+            except Exception:
+                self._notify = None  # daemon gone; fall back to notify-send
+        if self._fallback_ok is False:
+            return False
+        try:
+            import subprocess  # type: ignore
+
+            subprocess.run(
+                ["notify-send", "-a", self._app_name, "-i", icon, summary, body or ""],
+                check=False,
+                timeout=5,
+            )
+            self._fallback_ok = True
+            return True
+        except Exception as e:
+            if self._fallback_ok is None:
+                _log(f"Desktop notifications unavailable ({e}); continuing without them")
+            self._fallback_ok = False
+            return False
 
 
 # --- Numeric tray icon ------------------------------------------------------
@@ -437,6 +545,134 @@ def _write_badge_png(percent: int, path: str) -> bool:
     return True
 
 
+# --- Battery history + runtime estimate ----------------------------------------
+
+
+def _fmt_hours(hours: float) -> str:
+    """Compact duration for estimates: 45m, 2h 05m, 3d."""
+    minutes = max(0, int(round(hours * 60)))
+    if minutes >= 60 * 48:
+        return f"{minutes // (60 * 24)}d"
+    h, m = divmod(minutes, 60)
+    if h == 0:
+        return f"{m}m"
+    if h >= 10:
+        return f"{h}h"
+    return f"{h}h {m:02d}m"
+
+
+class BatteryHistory:
+    """Battery percentage history: CSV log + drain-rate runtime estimate.
+
+    The CSV (HISTORY_CSV) gets one row per percentage change, so it stays
+    small while still capturing the discharge curve. The runtime estimate
+    is a least-squares slope of percent over time across the recent
+    window; it needs a few minutes of data before it appears.
+    """
+
+    WINDOW_SECONDS = 30 * 60  # regression window
+    MIN_SPAN_SECONDS = 5 * 60  # minimum data span for an estimate
+    MIN_RATE = 0.5  # |%/h| below this counts as "no clear trend"
+
+    def __init__(self, csv_path: str = HISTORY_CSV, enabled: bool = True):
+        self.csv_path = csv_path
+        self.enabled = enabled
+        self._samples: list = []  # (unix_ts, percent), newest last
+        self._last_percent: Optional[int] = None
+        self._log_error_reported = False
+        if self.enabled:
+            try:
+                os.makedirs(os.path.dirname(self.csv_path), exist_ok=True)
+            except OSError:
+                pass
+            self._load_recent_tail()
+
+    def _load_recent_tail(self) -> None:
+        """Seed the in-memory samples from a previous session (recent rows)."""
+        try:
+            cutoff = time.time() - 2 * self.WINDOW_SECONDS
+            with open(self.csv_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split(",")
+                    if len(parts) < 3 or not parts[0][:1].isdigit():
+                        continue  # header or malformed line
+                    try:
+                        ts, percent = float(parts[0]), int(parts[2])
+                    except ValueError:
+                        continue
+                    if ts >= cutoff:
+                        self._samples.append((ts, percent))
+            if self._samples:
+                self._last_percent = self._samples[-1][1]
+                _log(f"Battery history: {len(self._samples)} recent samples loaded from {self.csv_path}")
+        except OSError:
+            pass  # no history yet
+
+    def record(self, percent: int) -> None:
+        """Record a battery reading; appends a CSV row on every change."""
+        now = time.time()
+        if self._last_percent != percent:
+            self._append_csv(now, percent)
+            self._last_percent = percent
+        self._samples.append((now, percent))
+        if len(self._samples) > 4096:
+            cutoff = now - 4 * self.WINDOW_SECONDS
+            self._samples = [s for s in self._samples if s[0] >= cutoff] or self._samples[-1:]
+
+    def _append_csv(self, ts: float, percent: int) -> None:
+        if not self.enabled:
+            return
+        try:
+            new_file = not os.path.exists(self.csv_path)
+            with open(self.csv_path, "a", encoding="utf-8") as f:
+                if new_file:
+                    f.write("unix_timestamp,iso_time,percent\n")
+                iso = datetime.fromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%S")
+                f.write(f"{ts:.0f},{iso},{percent}\n")
+        except OSError as e:
+            if not self._log_error_reported:
+                _log(f"Cannot write battery history {self.csv_path}: {e}")
+                self._log_error_reported = True
+
+    def drain_rate_per_hour(self) -> Optional[float]:
+        """Least-squares battery slope in %/hour over the recent window.
+
+        Negative = discharging, positive = charging. None when there is
+        not enough data yet.
+        """
+        now = time.time()
+        window = [s for s in self._samples if s[0] >= now - self.WINDOW_SECONDS]
+        if len(window) < 2:
+            return None
+        t0 = window[0][0]
+        if window[-1][0] - t0 < self.MIN_SPAN_SECONDS:
+            return None
+        xs = [(t - t0) / 3600.0 for t, _ in window]
+        ys = [p for _, p in window]
+        n = float(len(xs))
+        mean_x = sum(xs) / n
+        mean_y = sum(ys) / n
+        denom = sum((x - mean_x) ** 2 for x in xs)
+        if denom <= 0:
+            return None
+        return sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
+
+    def summary(self, percent: Optional[int]) -> tuple:
+        """(menu_line, tooltip_line) derived from the current drain rate."""
+        rate = self.drain_rate_per_hour()
+        if rate is None:
+            return None, None
+        if rate <= -self.MIN_RATE and percent is not None:
+            left = _fmt_hours(percent / -rate)
+            return (f"Est. remaining: ~{left} ({rate:+.1f}%/h)",
+                    f"Drain rate: {rate:+.1f}%/h -> est. ~{left} left")
+        if rate >= self.MIN_RATE:
+            # Charging is not exposed over HID (verified); a rising battery
+            # is the closest observable signal, so mark it as inferred.
+            return None, "Battery level is rising (charging?)"
+        return None, f"Drain rate: {rate:+.1f}%/h"
+
+
 @dataclass
 class BatterySample:
     percent: int
@@ -462,12 +698,14 @@ class StatusSample:
     mic_muted: Optional[bool] = None
     mix: Optional[int] = None  # 0..16, 0=full chat, 0x10=full game
     lights: Optional[bool] = None
+    sidetone: Optional[int] = None  # 0=off, 1=low, 2=mid, 3=high
     power_marker: bool = False  # 0x03/0x09 power-on markers
     source: str = ""
     raw_hex: str = ""
     ts: float = 0.0
 
     ANC_NAMES = {0: "off", 1: "on", 2: "talk-through"}
+    SIDETONE_NAMES = {0: "off", 1: "low", 2: "mid", 3: "high"}
 
     def anc_label(self) -> Optional[str]:
         if self.anc is None:
@@ -686,6 +924,47 @@ class HidrawBatteryReader:
             _log(f"SET feature 0x{rid:02x} failed on {self.path}: {e}")
             return False
 
+    def send_feature_bytes(self, data: bytes) -> bool:
+        """SET_REPORT(Feature, data) with data[0] = report ID (raw length).
+
+        Used by the lighting table writes (0x4c/0x4d are 4/8-byte reports).
+        CHANGES DEVICE STATE.
+        """
+        if self._fd is None:
+            try:
+                self._ensure_open()
+            except Exception:
+                return False
+        if self._fd is None or not self._can_feature_read:
+            _log("hidraw not opened read/write; cannot send feature report")
+            return False
+        try:
+            fcntl.ioctl(self._fd, self._HIDIOCSFEATURE | (len(data) << 16), bytes(data), True)
+            return True
+        except OSError as e:
+            _log(f"SET feature 0x{data[0]:02x} failed on {self.path}: {e}")
+            return False
+
+    def arm_lighting(self) -> bool:
+        """Run the QuantumENGINE connect-time GET round that enables lighting.
+
+        Verified live: without this round the dongle accepts the lighting
+        SETs but the headset ignores them. The GETs are read-only; the armed
+        state persists for at least several minutes.
+        """
+        if self._fd is None:
+            try:
+                self._ensure_open()
+            except Exception:
+                return False
+        if self._fd is None or not self._can_feature_read:
+            return False
+        answered = 0
+        for rid in LIGHT_ARM_GET_RIDS:
+            if self.read_feature(rid, 64) is not None:
+                answered += 1
+        return answered > 0
+
     def read_feature(self, rid: int, length: int = 16) -> Optional[bytes]:
         """GET_REPORT(Feature, rid) - read-only."""
         if self._fd is None:
@@ -722,6 +1001,7 @@ class HidrawBatteryReader:
           0x4a -> lights   [0x4a, 0=off/1=on]                (mirrors SET 0x4b)
           0x62 -> mix      [0x62, 0..16]                     (mirrors event 0x10)
           0x67 -> mic      [0x67, 1=on, 0=muted]             (mirrors event 0x06)
+          0x5c -> sidetone [0x5c, 0=off/1=low/2=mid/3=high]  (mirrors SET 0x5d)
         Returns a StatusSample; individual fields stay None when a read
         fails or the echoed report id does not match.
         """
@@ -735,7 +1015,7 @@ class HidrawBatteryReader:
 
         sample = StatusSample(
             source=f"hidraw-feat:{self.path}",
-            raw_hex="features 0x45/0x67/0x4a/0x62",
+            raw_hex="features 0x45/0x67/0x4a/0x62/0x5c",
             ts=time.time(),
         )
         feat = self.read_feature(0x45, 2)
@@ -751,6 +1031,9 @@ class HidrawBatteryReader:
         feat = self.read_feature(0x62, 2)
         if feat and feat[0] == 0x62 and 0 <= feat[1] <= 16:
             sample.mix = int(feat[1])
+        feat = self.read_feature(0x5C, 2)
+        if feat and feat[0] == 0x5C and feat[1] in (0, 1, 2, 3):
+            sample.sidetone = int(feat[1])
         return sample
 
 
@@ -944,7 +1227,7 @@ class PyUsbBatteryReader:
 
 
 class BatteryTrayApp:
-    def __init__(self, refresh_seconds: float, prefer_pyusb: bool, pyusb_detach: bool, numeric_icon: bool = False, enable_controls: bool = False):
+    def __init__(self, refresh_seconds: float, prefer_pyusb: bool, pyusb_detach: bool, numeric_icon: bool = False, enable_controls: bool = False, notifications: bool = True, notify_mute: bool = False):
         self.refresh_seconds = max(0.2, refresh_seconds)
         self.prefer_pyusb = prefer_pyusb
 
@@ -967,6 +1250,15 @@ class BatteryTrayApp:
         self._serial_tried: bool = False
         self._last_logged_anc: Optional[int] = None
         self._last_logged_mix: Optional[int] = None
+        self._sidetone: Optional[int] = None  # 0=off, 1=low, 2=mid, 3=high
+        self._last_logged_sidetone: Optional[int] = None
+
+        # Desktop notifications (low battery, dongle connect/disconnect;
+        # mute changes only with --notify-mute) + battery history/estimate.
+        self.notifier = Notifier("jbl-quantum910-battery", enabled=notifications)
+        self.notify_mute = notify_mute
+        self._alerted_levels: set = set()
+        self.history = BatteryHistory()
 
         self.hidraw_reader: Optional[HidrawBatteryReader] = None
         # Keep `pyusb_detach` for CLI compatibility, but the default behavior
@@ -1035,10 +1327,24 @@ class BatteryTrayApp:
         if hidraw == current:
             return
         if hidraw:
+            was_connected = current is not None
             self._attach_hidraw_reader(hidraw)
+            if not was_connected:
+                # Real hotplug transition: the initial device is attached
+                # in __init__, so this never fires for the first detection.
+                self.notifier.send(
+                    f"{self._model_name} connected",
+                    "USB dongle detected.",
+                    icon="audio-headset-symbolic",
+                )
         elif self.hidraw_reader is not None:
             _log(f"hidraw node {current} is gone; waiting for it to reappear")
             self.hidraw_reader = None
+            self.notifier.send(
+                f"{self._model_name} disconnected",
+                "USB dongle no longer visible.",
+                icon="audio-headset-symbolic",
+            )
 
     def _build_menu(self):
         menu = self.Gtk.Menu()
@@ -1046,6 +1352,12 @@ class BatteryTrayApp:
         self._status_item = self.Gtk.MenuItem(label="Battery: --%")
         self._status_item.set_sensitive(False)
         menu.append(self._status_item)
+
+        # Estimated runtime left (from the battery drain history; stays at
+        # "--" until enough data has been collected).
+        self._menu_estimate_item = self.Gtk.MenuItem(label="Est. remaining: --")
+        self._menu_estimate_item.set_sensitive(False)
+        menu.append(self._menu_estimate_item)
 
         # Extra headset state (Quantum 810 event map):
         self._menu_anc_item = self.Gtk.MenuItem(label="ANC: --")
@@ -1059,6 +1371,14 @@ class BatteryTrayApp:
         self._menu_mix_item = self.Gtk.MenuItem(label="Game/Chat: --")
         self._menu_mix_item.set_sensitive(False)
         menu.append(self._menu_mix_item)
+
+        self._menu_lights_item = self.Gtk.MenuItem(label="Lights: --")
+        self._menu_lights_item.set_sensitive(False)
+        menu.append(self._menu_lights_item)
+
+        self._menu_sidetone_item = self.Gtk.MenuItem(label="Sidetone: --")
+        self._menu_sidetone_item.set_sensitive(False)
+        menu.append(self._menu_sidetone_item)
 
         self._menu_serial_item = self.Gtk.MenuItem(label="Serial: --")
         self._menu_serial_item.set_sensitive(False)
@@ -1077,18 +1397,42 @@ class BatteryTrayApp:
             anc_item.connect("activate", lambda *_: self._cycle_anc())
             menu.append(anc_item)
 
-            lights_item = self.Gtk.MenuItem(label="Toggle lights")
-            lights_item.connect("activate", lambda *_: self._toggle_lights())
-            menu.append(lights_item)
+            self._menu_lights_toggle_item = self.Gtk.MenuItem(label="Lights: toggle")
+            self._menu_lights_toggle_item.connect("activate", lambda *_: self._toggle_lights())
+            menu.append(self._menu_lights_toggle_item)
 
+            # Radio items so the submenu marks the level read back via 0x5c.
             sidetone_menu = self.Gtk.Menu()
-            for level in ("off", "low", "mid", "high"):
-                sub = self.Gtk.MenuItem(label=f"Sidetone: {level}")
-                sub.connect("activate", lambda _w, lv=level: self._set_sidetone(lv))
+            self._sidetone_radio_items = {}
+            group_leader = None
+            for level, value in (("off", 0), ("low", 1), ("mid", 2), ("high", 3)):
+                sub = self.Gtk.RadioMenuItem(label=f"Sidetone: {level}")
+                if group_leader is not None:
+                    sub.join_group(group_leader)
+                else:
+                    group_leader = sub
+                sub.connect("activate", lambda _w, v=value: self._set_sidetone(v))
                 sidetone_menu.append(sub)
+                self._sidetone_radio_items[value] = sub
             sidetone_item = self.Gtk.MenuItem(label="Sidetone")
             sidetone_item.set_submenu(sidetone_menu)
             menu.append(sidetone_item)
+
+            # RGB lighting (logo + ring elements, Quantum 810): pick a color
+            # or use a preset. Applies as a breathing-style color effect.
+            lighting_menu = self.Gtk.Menu()
+            pick_item = self.Gtk.MenuItem(label="Pick color…")
+            pick_item.connect("activate", lambda *_: self._pick_lighting_color())
+            lighting_menu.append(pick_item)
+            for name, rgb in (("Red", (255, 0, 0)), ("Green", (0, 255, 0)),
+                              ("Blue", (0, 0, 255)), ("White", (255, 255, 255)),
+                              ("Teal (factory)", (0x33, 0xFF, 0xCC))):
+                preset = self.Gtk.MenuItem(label=f"Color: {name}")
+                preset.connect("activate", lambda _w, c=rgb: self._set_lighting_color(c))
+                lighting_menu.append(preset)
+            lighting_item = self.Gtk.MenuItem(label="Lighting")
+            lighting_item.set_submenu(lighting_menu)
+            menu.append(lighting_item)
 
         item_sep = self.Gtk.SeparatorMenuItem()
         menu.append(item_sep)
@@ -1120,12 +1464,74 @@ class BatteryTrayApp:
             _log(f"Lights {'on' if new_state else 'off'} (feature 0x4b)")
             self._render()
 
-    def _set_sidetone(self, level: str) -> None:
-        values = {"off": 0, "low": 1, "mid": 2, "high": 3}
+    def _set_sidetone(self, value: int) -> None:
         if self.hidraw_reader is None:
             return
-        if self.hidraw_reader.send_feature(0x5D, values[level]):
-            _log(f"Sidetone set to {level} (feature 0x5d)")
+        if self.hidraw_reader.send_feature(0x5D, value):
+            name = StatusSample.SIDETONE_NAMES.get(value, str(value))
+            _log(f"Sidetone set to {name} (feature 0x5d)")
+            self._sidetone = value
+            self._update_sidetone_radios()
+
+    def _update_sidetone_radios(self) -> None:
+        """Reflect the current sidetone level in the radio menu items."""
+        items = getattr(self, "_sidetone_radio_items", None)
+        if not items:
+            return
+        for value, item in items.items():
+            try:
+                item.set_active(value == self._sidetone)
+            except Exception:
+                pass
+
+    def _set_lighting_color(self, rgb: tuple) -> None:
+        """Write one color to both lighting elements (logo + ring).
+
+        CHANGES DEVICE STATE - only reachable with --enable-controls.
+        Sequence (verified live): arm via the QuantumENGINE GET round,
+        lights off, write the per-element tables, lights back on (the table
+        applies on the off->on transition). The headset renders the color
+        with its breathing-style effect; there is no read-back for the
+        table, so nothing is tracked between restarts.
+        """
+        if self.hidraw_reader is None:
+            return
+        r, g, b = rgb
+        hexname = f"#{r:02X}{g:02X}{b:02X}"
+        _log(f"Lighting: setting {hexname} (logo+ring)")
+        if not self.hidraw_reader.arm_lighting():
+            _log("Lighting: arming GET round failed; the headset may ignore the table")
+        # Apply cycle: the table takes effect on the lights off->on transition.
+        self.hidraw_reader.send_feature_bytes(bytes([0x4B, 0x00]))
+        ok = True
+        for element in LIGHT_ELEMENTS:
+            for rep in build_lighting_reports((r, g, b), element):
+                if not self.hidraw_reader.send_feature_bytes(rep):
+                    ok = False
+                    break
+            if not ok:
+                break
+        if ok:
+            self.hidraw_reader.send_feature_bytes(bytes([0x4B, 0x01]))
+            self._lights_on = True
+            _log(f"Lighting set to {hexname} (5 segments per element, tempo {LIGHT_TEMPO}, applied via lights off->on)")
+        else:
+            _log(f"Lighting: failed to write the {hexname} table")
+        self._render()
+
+    def _pick_lighting_color(self) -> None:
+        """Open a color chooser and apply the picked color to both elements."""
+        dialog = self.Gtk.ColorChooserDialog(title=f"{self._model_name} lighting color")
+        dialog.set_use_alpha(False)
+        try:
+            if dialog.run() == self.Gtk.ResponseType.OK:
+                rgba = dialog.get_rgba()
+                rgb = (int(round(rgba.red * 255)),
+                       int(round(rgba.green * 255)),
+                       int(round(rgba.blue * 255)))
+                self._set_lighting_color(rgb)
+        finally:
+            dialog.destroy()
 
     def _quit(self):
         try:
@@ -1284,8 +1690,16 @@ class BatteryTrayApp:
                 _log(f"Game/Chat mix: {self._mix}/16 (source={status_sample.source})")
                 self._last_logged_mix = self._mix
             needs_render = True
-        if status_sample.lights is not None:
+        if status_sample.lights is not None and status_sample.lights != self._lights_on:
             self._lights_on = status_sample.lights
+            _log(f"Lights {'on' if self._lights_on else 'off'} (source={status_sample.source})")
+            needs_render = True
+        if status_sample.sidetone is not None and status_sample.sidetone != self._sidetone:
+            self._sidetone = status_sample.sidetone
+            if self._last_logged_sidetone != self._sidetone:
+                _log(f"Sidetone: {StatusSample.SIDETONE_NAMES.get(self._sidetone, self._sidetone)} (source={status_sample.source})")
+                self._last_logged_sidetone = self._sidetone
+            needs_render = True
         if status_sample.mic_muted is not None:
             # Make the mic state visible in the menu as soon as we know it.
             if self.last_mute_sample is None:
@@ -1320,6 +1734,27 @@ class BatteryTrayApp:
                 pass
         self._render()
 
+    def _check_low_battery(self, percent: int) -> None:
+        """Notify when a low-battery threshold is crossed (once per crossing).
+
+        When several thresholds are crossed at once, only the lowest one is
+        notified. Thresholds re-arm once the battery recovers 3% above
+        them, so a recharge cycle can trigger them again later.
+        """
+        newly_crossed = [lv for lv in LOW_BATTERY_LEVELS
+                         if percent <= lv and lv not in self._alerted_levels]
+        if newly_crossed:
+            level = min(newly_crossed)
+            self._alerted_levels.update(newly_crossed)
+            self.notifier.send(
+                f"{self._model_name} battery low",
+                f"Battery is at {percent}% (threshold {level}%).",
+                icon="battery-caution-symbolic",
+            )
+        for level in LOW_BATTERY_LEVELS:
+            if percent > level + 3:
+                self._alerted_levels.discard(level)
+
     def _tick(self):
         # Pick up a hidraw node that appeared after startup (e.g. after the
         # dongle was replugged following a pyusb session).
@@ -1338,6 +1773,9 @@ class BatteryTrayApp:
                 _log(f"Battery: {battery_sample.percent}% (source={battery_sample.source}, data={battery_sample.raw_hex})")
                 self._last_logged_percent = battery_sample.percent
                 self._last_logged_error = None
+            # Battery history (drain-rate estimate) + low-battery alerts.
+            self.history.record(battery_sample.percent)
+            self._check_low_battery(battery_sample.percent)
         else:
             # Surface pyusb errors (most common: permission / claim interface)
             err = getattr(self.pyusb_reader, "last_error", None)
@@ -1364,6 +1802,12 @@ class BatteryTrayApp:
             # Force render if mute state changed
             if old_muted != self._is_muted:
                 needs_render = True
+                if self.notify_mute:
+                    self.notifier.send(
+                        f"Microphone {'muted' if self._is_muted else 'unmuted'}",
+                        self._model_name,
+                        icon="microphone-sensitivity-muted-symbolic" if self._is_muted else "audio-input-microphone-symbolic",
+                    )
         
         if status_sample is not None:
             if self._apply_status(status_sample):
@@ -1431,6 +1875,15 @@ class BatteryTrayApp:
             except Exception:
                 pass
 
+        # Estimated runtime left from the battery drain history.
+        est_menu, est_tip = None, None
+        if getattr(self, "_menu_estimate_item", None):
+            try:
+                est_menu, est_tip = self.history.summary(percent)
+                self._menu_estimate_item.set_label(est_menu or "Est. remaining: --")
+            except Exception:
+                pass
+
         err = getattr(self.pyusb_reader, "last_error", None)
         if percent is not None:
             mute_indicator = " 🔇" if self._is_muted else ""
@@ -1477,6 +1930,15 @@ class BatteryTrayApp:
                 self._menu_mix_item.set_label(f"Game/Chat: {tmp.mix_label() or '--'}")
             if getattr(self, "_menu_serial_item", None) is not None:
                 self._menu_serial_item.set_label(f"Serial: {self._serial or '--'}")
+            if getattr(self, "_menu_lights_item", None) is not None:
+                lights_txt = "--" if self._lights_on is None else ("on" if self._lights_on else "off")
+                self._menu_lights_item.set_label(f"Lights: {lights_txt}")
+            if getattr(self, "_menu_sidetone_item", None) is not None:
+                side_txt = StatusSample.SIDETONE_NAMES.get(self._sidetone) if self._sidetone is not None else None
+                self._menu_sidetone_item.set_label(f"Sidetone: {side_txt or '--'}")
+            if getattr(self, "_menu_lights_toggle_item", None) is not None and self._lights_on is not None:
+                self._menu_lights_toggle_item.set_label("Lights: turn off" if self._lights_on else "Lights: turn on")
+            self._update_sidetone_radios()
         except Exception:
             pass
 
@@ -1487,10 +1949,16 @@ class BatteryTrayApp:
             anc_status = StatusSample.ANC_NAMES.get(self._anc, "--") if self._anc is not None else "--"
             mix_status = StatusSample(mix=self._mix).mix_label() or "--"
             serial_status = self._serial or "--"
+            lights_status = "--" if self._lights_on is None else ("on" if self._lights_on else "off")
+            sidetone_status = StatusSample.SIDETONE_NAMES.get(self._sidetone) if self._sidetone is not None else "--"
+            est_line = f"{est_tip}\n" if est_tip else ""
             tip = (f"{self._model_name}: {self.last_sample.percent}%\n"
                    f"Microphone: {mute_status}\n"
                    f"ANC: {anc_status}\n"
                    f"Game/Chat mix: {mix_status}\n"
+                   f"Lights: {lights_status}\n"
+                   f"Sidetone: {sidetone_status}\n"
+                   f"{est_line}"
                    f"Serial: {serial_status}\n"
                    f"Source: {self.last_sample.source}\n"
                    f"Updated: {age_s:.0f}s ago\n"
@@ -1557,6 +2025,17 @@ def main() -> int:
         help="Add headset controls to the menu (ANC cycle, lights toggle, "
         "sidetone). These CHANGE device state via HID feature reports.",
     )
+    parser.add_argument(
+        "--no-notifications",
+        action="store_true",
+        help="Disable desktop notifications (low battery, dongle "
+        "connect/disconnect).",
+    )
+    parser.add_argument(
+        "--notify-mute",
+        action="store_true",
+        help="Also send a desktop notification on every mute change.",
+    )
     args = parser.parse_args()
 
     app = BatteryTrayApp(
@@ -1565,6 +2044,8 @@ def main() -> int:
         pyusb_detach=args.pyusb_detach_kernel,
         numeric_icon=(args.numeric_icon and not args.no_numeric_icon),
         enable_controls=args.enable_controls,
+        notifications=(not args.no_notifications),
+        notify_mute=args.notify_mute,
     )
     app.run()
     return 0

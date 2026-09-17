@@ -81,8 +81,56 @@ SET_REPORT(Feature) requests; on Linux the hidraw `HIDIOCSFEATURE` ioctl is
 equivalent. Each accepted command is acknowledged by the matching event
 report (`0x02` for ANC, `0x07` for lights).
 
-Lighting color effects use reports `0x4c`/`0x4d` (RGB streams) - not
-implemented here.
+### Lighting colors/effects (RGB) - reports 0x4c/0x4d
+
+Decoded from the #357 captures and verified live on a Quantum 810
+(2026-09) - see the full "Lighting (RGB)" section below.
+
+## Lighting (RGB) - decoded and verified live
+
+QuantumENGINE's lighting model: per lighting **element** (0 = logo,
+1 = ring on the earcups) an effect (Breathing/Solid/Wave/Glitch) plays a
+sequence of color **segments** whose interval distribution follows a
+**tempo** slider. The software pushes it over HID feature reports:
+
+| Report | Payload | Meaning |
+|--------|---------|---------|
+| `0x4c` | `[4c, element, tempo, segments]` | table header; tempo seen: `0x32`/`0x64` (slider 50/100); segments = 5 |
+| `0x4d` | `[4d, element, index, R, G, B, M, index*2]` | one color segment; **RGB = bytes 3-5** (verified: `ff0000` renders red, `00ff00` green, `0000ff` blue); `M` = interval/duration marker (`00/02/04/05` seen; `05` pulses visibly longer than `02`); last byte = `index*2` |
+| `0x4b` | `[4b, 0/1]` | lights off/on (commit; already known) |
+
+Verified behavior (live on a Quantum 810 via hidraw):
+
+- **Arming required**: the lighting SETs only take effect after the
+  QuantumENGINE connect-time GET round (`0x50, 0x68, 0x51, 0x45, 0x67,
+  0x5c, 0x62, 0x49, 0x47, 0x4a, 0x5b` in that order). Without it the dongle
+  still accepts and caches the SETs - the `0x4a` read-back even flips! -
+  but the headset ignores them (no LED change, no `07` event). Arming
+  persists for at least several minutes.
+- **Apply cycle**: the table takes effect on the lights OFF->ON transition.
+  Writes while the lights are on do not change the running effect; the
+  dongle applies the cached table at the next off->on cycle.
+- **ACKs**: `0x4b` toggles are ACKed by `0x07` events, but only on actual
+  state changes (a redundant `4b 01` while already on produces no event).
+- **Element mapping**: element 0 = logo, element 1 = ring (verified live
+  with distinct colors per element).
+- **No read-back**: GET on `0x4c`/`0x4d`/`0x4e` answers with the nearest
+  known lower report (`0x61` serial, echo-ID mismatch) - the color table
+  cannot be read back. QuantumENGINE also only ever pushes it.
+- A solid color = 5 identical segments and renders as a breathing-style
+  pulse (a true steady "Solid" encoding is still open, see below).
+
+Open questions (not yet decoded):
+
+- Exact meaning of the `M` byte (interval length in tempo units?) and of
+  the `0x4c` 4th byte (segment count vs effect ID - `01`/`04` variants
+  were tried with unclear results).
+- How "Solid"/"Wave"/"Glitch" effects are encoded (other header values,
+  other reports, or tempo `0x00`?).
+- Why later table writes only partially replace segments (colors from
+  older writes can persist in the cycle) - possibly a rolling segment
+  queue rather than a fixed table.
+- The minimal arming GET (the full round is used as the safe recipe).
 
 ## What is NOT (yet) monitorable
 
@@ -90,7 +138,6 @@ implemented here.
   (battery climbing 65->70%), no event or feature report changed except the
   battery value itself. The `0x08` battery packets carry no charging flag.
   The dongle simply does not expose charging state over HID.
-- **Sidetone level read-back**: SET (`0x5d`) is confirmed, GET answer unknown.
 - **Spatial sound / DTS**: seen in captures only as SET_REPORTs without an
   event echo; not decoded.
 - **Head tracking**: only the newer Quantum 950 generation (event `0x86...`
@@ -100,7 +147,11 @@ implemented here.
 
 - `tools/jbl_status.py` - status reader + controls CLI (`--json`, `--watch`,
   `--set-anc`, `--set-lights`, `--set-sidetone`)
+- `tools/jbl_rgb.py` - RGB lighting CLI (`--status` read-only probe,
+  `--solid RRGGBB [--element logo|ring|both]`, `--default` factory table,
+  `--raw` hex sequences; arms automatically before writes)
 - `tools/jbl_status_probe.py` - live protocol probe (`--monitor`, `--features`,
   `--scan`, `--correlate`)
-- `jbl_quantum910_tray.py` - tray shows ANC/mic/mix/serial; menu controls
-  behind `--enable-controls`
+- `jbl_quantum910_tray.py` - tray shows ANC/mic/mix/lights/sidetone/serial
+  plus a battery drain estimate; menu controls behind `--enable-controls`,
+  including a Lighting color picker (breathing effect)
