@@ -27,6 +27,7 @@ import errno
 import fcntl
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -70,6 +71,22 @@ LIGHT_ELEMENTS = (0, 1)  # element 0 = logo, element 1 = ring (verified live)
 LIGHT_SEGMENTS = 5       # color segments per element (QuantumENGINE default)
 LIGHT_TEMPO = 0x64       # tempo byte (0x32/0x64 observed = slider value)
 LIGHT_MODES = {0: 0x02, 1: 0x05}  # per-segment interval marker (M byte)
+# Lighting write recipe (live-tuned): (1) pace every SET_REPORT - writes
+# fired back-to-back can be dropped by the dongle/2.4 GHz link (live: the
+# ring's writes - last in the burst - went missing entirely); (2) clear the
+# whole table with LIGHT_RESET_SEGMENTS identical frames (stale colors from
+# earlier changes otherwise keep cycling - "red with a blue tail",
+# "yellow rendering white"); (3) write the final LIGHT_SEGMENTS table -
+# the 0x4c segment count sets how many segments share the tempo cycle, so
+# counts above 5 pulse visibly faster (live: 16 pulsed "super fast").
+# 10 ms per SET keeps a color change snappy (~0.5 s to the commit); if
+# color mixing ever reappears, raise the delay (--lighting-delay).
+LIGHT_RESET_SEGMENTS = 16
+LIGHT_SET_DELAY = 0.01
+# The arming GET round only has to run once in a while: the armed state
+# persists for at least several minutes (verified), so repeated changes
+# skip the 12 GETs within LIGHT_ARM_TTL (keeps the reaction latency low).
+LIGHT_ARM_TTL = 60.0
 
 
 def _import_appindicator():
@@ -239,6 +256,10 @@ def build_lighting_reports(color: tuple, element: int = 0, tempo: int = LIGHT_TE
     `segments` identical frames; the headset renders it with its
     breathing-style effect (QuantumENGINE distributes colors over tempo
     intervals). Element 0 = logo, 1 = ring.
+
+    Writing more than the QuantumENGINE-default 5 segments overwrites the
+    whole device table (a full reset: stale segments from earlier colors
+    otherwise keep cycling in the effect).
 
     Returns the report payloads in send order: one 0x4c header followed by
     `segments` 0x4d frames. The sequence only takes effect after the
@@ -744,6 +765,7 @@ class HidrawBatteryReader:
             except Exception:
                 pass
         self._fd = None
+        self._armed_at = 0.0  # fresh node: lighting arming must run again
 
     def _ensure_open(self) -> None:
         if self._fd is not None:
@@ -924,10 +946,12 @@ class HidrawBatteryReader:
             _log(f"SET feature 0x{rid:02x} failed on {self.path}: {e}")
             return False
 
-    def send_feature_bytes(self, data: bytes) -> bool:
+    def send_feature_bytes(self, data: bytes, delay: float = 0.0) -> bool:
         """SET_REPORT(Feature, data) with data[0] = report ID (raw length).
 
         Used by the lighting table writes (0x4c/0x4d are 4/8-byte reports).
+        `delay` pauses after the write: the lighting sequence must not be
+        sent back-to-back or the dongle/2.4 GHz link can drop reports.
         CHANGES DEVICE STATE.
         """
         if self._fd is None:
@@ -940,17 +964,21 @@ class HidrawBatteryReader:
             return False
         try:
             fcntl.ioctl(self._fd, self._HIDIOCSFEATURE | (len(data) << 16), bytes(data), True)
+            if delay > 0:
+                time.sleep(delay)
             return True
         except OSError as e:
             _log(f"SET feature 0x{data[0]:02x} failed on {self.path}: {e}")
             return False
 
-    def arm_lighting(self) -> bool:
+    def arm_lighting(self, force: bool = False) -> bool:
         """Run the QuantumENGINE connect-time GET round that enables lighting.
 
         Verified live: without this round the dongle accepts the lighting
         SETs but the headset ignores them. The GETs are read-only; the armed
-        state persists for at least several minutes.
+        state persists for at least several minutes, so the round is skipped
+        while fresh (LIGHT_ARM_TTL) to keep color changes snappy - `force`
+        re-runs it regardless.
         """
         if self._fd is None:
             try:
@@ -959,10 +987,15 @@ class HidrawBatteryReader:
                 return False
         if self._fd is None or not self._can_feature_read:
             return False
+        now = time.time()
+        if not force and now - getattr(self, "_armed_at", 0.0) < LIGHT_ARM_TTL:
+            return True
         answered = 0
         for rid in LIGHT_ARM_GET_RIDS:
             if self.read_feature(rid, 64) is not None:
                 answered += 1
+        if answered > 0:
+            self._armed_at = now
         return answered > 0
 
     def read_feature(self, rid: int, length: int = 16) -> Optional[bytes]:
@@ -1227,7 +1260,7 @@ class PyUsbBatteryReader:
 
 
 class BatteryTrayApp:
-    def __init__(self, refresh_seconds: float, prefer_pyusb: bool, pyusb_detach: bool, numeric_icon: bool = False, enable_controls: bool = False, notifications: bool = True, notify_mute: bool = False):
+    def __init__(self, refresh_seconds: float, prefer_pyusb: bool, pyusb_detach: bool, numeric_icon: bool = False, enable_controls: bool = False, notifications: bool = True, notify_mute: bool = False, lighting_delay: float = LIGHT_SET_DELAY, lighting_reset_segments: int = LIGHT_RESET_SEGMENTS):
         self.refresh_seconds = max(0.2, refresh_seconds)
         self.prefer_pyusb = prefer_pyusb
 
@@ -1252,6 +1285,15 @@ class BatteryTrayApp:
         self._last_logged_mix: Optional[int] = None
         self._sidetone: Optional[int] = None  # 0=off, 1=low, 2=mid, 3=high
         self._last_logged_sidetone: Optional[int] = None
+
+        # Lighting write tuning (see --lighting-delay / --lighting-reset-
+        # segments) + worker state (rapid clicks are coalesced, a lights
+        # toggle aborts an in-flight write so the toggle stays authoritative).
+        self.lighting_delay = max(0.0, float(lighting_delay))
+        self.lighting_reset_segments = max(1, int(lighting_reset_segments))
+        self._lighting_busy = False
+        self._lighting_pending: Optional[tuple] = None
+        self._lighting_abort = False
 
         # Desktop notifications (low battery, dongle connect/disconnect;
         # mute changes only with --notify-mute) + battery history/estimate.
@@ -1459,9 +1501,21 @@ class BatteryTrayApp:
         if self.hidraw_reader is None:
             return
         new_state = not (self._lights_on or False)
+        if self._lighting_busy:
+            # An in-flight lighting write ends with its own lights-on commit,
+            # which would override this toggle: abort the write (when turning
+            # the lights off) or let it finish (when turning them on).
+            if new_state:
+                _log("Lights: lighting write in progress; it commits lights on")
+            else:
+                self._lighting_abort = True
+                self._lighting_pending = None
+                _log("Lights: aborting the in-flight lighting write (lights off requested)")
         if self.hidraw_reader.send_feature(0x4B, 1 if new_state else 0):
             self._lights_on = new_state
-            _log(f"Lights {'on' if new_state else 'off'} (feature 0x4b)")
+            state = self.hidraw_reader.read_feature(0x4A, 4)
+            echoed = state[1] if state and len(state) > 1 else None
+            _log(f"Lights {'on' if new_state else 'off'} (feature 0x4b; read-back 0x4a: {echoed})")
             self._render()
 
     def _set_sidetone(self, value: int) -> None:
@@ -1504,36 +1558,96 @@ class BatteryTrayApp:
         """Write one color to both lighting elements (logo + ring).
 
         CHANGES DEVICE STATE - only reachable with --enable-controls.
-        Sequence (verified live): arm via the QuantumENGINE GET round,
-        lights off, write the per-element tables, lights back on (the table
-        applies on the off->on transition). The headset renders the color
-        with its breathing-style effect; there is no read-back for the
-        table, so nothing is tracked between restarts.
+        Runs in a worker thread: the paced write sequence takes ~0.5 s and
+        must not block the GTK main loop. Rapid clicks are coalesced: the
+        newest color is applied right after the in-flight write (nothing is
+        dropped).
+
+        Sequence (verified live): arm via the QuantumENGINE GET round
+        (skipped while LIGHT_ARM_TTL fresh), lights off, clear the whole
+        table, write the final table, lights back on (the table applies on
+        the off->on transition). There is no read-back for the table, so
+        nothing is tracked between restarts.
         """
         if self.hidraw_reader is None:
             return
+        if self._lighting_busy:
+            self._lighting_pending = tuple(rgb)
+            _log("Lighting: change in progress; queueing the new color")
+            return
+        self._lighting_pending = None
+        self._lighting_busy = True
+        self._lighting_abort = False
+        _log(f"Lighting: setting #{rgb[0]:02X}{rgb[1]:02X}{rgb[2]:02X} (logo+ring)")
+
+        def worker() -> None:
+            color = tuple(rgb)
+            try:
+                while True:
+                    self._apply_lighting_color(color)
+                    pending = self._lighting_pending
+                    self._lighting_pending = None
+                    if pending is None:
+                        break
+                    self._lighting_abort = False  # explicit new color
+                    color = tuple(pending)
+            except Exception as e:  # never take the tray down
+                _log(f"Lighting: error applying color: {e}")
+            finally:
+                self._lighting_busy = False
+
+        threading.Thread(target=worker, daemon=True,
+                         name="jbl-lighting").start()
+
+    def _apply_lighting_color(self, rgb: tuple) -> None:
+        """Paced lighting table write (worker thread; no GTK calls here)."""
         r, g, b = rgb
         hexname = f"#{r:02X}{g:02X}{b:02X}"
-        _log(f"Lighting: setting {hexname} (logo+ring)")
-        if not self.hidraw_reader.arm_lighting():
+        delay = self.lighting_delay
+        reset_segments = self.lighting_reset_segments
+        reader = self.hidraw_reader
+        if self._lighting_abort:
+            # A lights toggle raced this write: the toggle wins - do not
+            # rewrite the table (and never commit its lights-on).
+            _log("Lighting: write skipped (lights were toggled meanwhile)")
+            self.GLib.idle_add(self._render)
+            return
+        if not reader.arm_lighting():
             _log("Lighting: arming GET round failed; the headset may ignore the table")
         # Apply cycle: the table takes effect on the lights off->on transition.
-        self.hidraw_reader.send_feature_bytes(bytes([0x4B, 0x00]))
+        reader.send_feature_bytes(bytes([0x4B, 0x00]), delay=delay)
         ok = True
+        # Clearing pass: overwrite every slot (stale colors from earlier
+        # changes or the factory table otherwise keep cycling).
         for element in LIGHT_ELEMENTS:
-            for rep in build_lighting_reports((r, g, b), element):
-                if not self.hidraw_reader.send_feature_bytes(rep):
+            for rep in build_lighting_reports((r, g, b), element,
+                                              segments=reset_segments):
+                if not reader.send_feature_bytes(rep, delay=delay):
                     ok = False
                     break
             if not ok:
                 break
-        if ok:
-            self.hidraw_reader.send_feature_bytes(bytes([0x4B, 0x01]))
+        # Final pass: QuantumENGINE-shape table - the 0x4c segment count
+        # sets how many segments share the tempo cycle, so counts above
+        # the stock 5 pulse visibly faster.
+        if ok and not self._lighting_abort:
+            for element in LIGHT_ELEMENTS:
+                for rep in build_lighting_reports((r, g, b), element,
+                                                  segments=LIGHT_SEGMENTS):
+                    if not reader.send_feature_bytes(rep, delay=delay):
+                        ok = False
+                        break
+                if not ok:
+                    break
+        if not self._lighting_abort and ok:
+            reader.send_feature_bytes(bytes([0x4B, 0x01]), delay=delay)
             self._lights_on = True
-            _log(f"Lighting set to {hexname} (5 segments per element, tempo {LIGHT_TEMPO}, applied via lights off->on)")
-        else:
+            _log(f"Lighting set to {hexname} (clear {reset_segments} + final {LIGHT_SEGMENTS} segments per element, tempo {LIGHT_TEMPO}, applied via lights off->on)")
+        elif not self._lighting_abort:
             _log(f"Lighting: failed to write the {hexname} table")
-        self._render()
+        else:
+            _log(f"Lighting: write to {hexname} aborted (lights toggled meanwhile)")
+        self.GLib.idle_add(self._render)
 
     def _pick_lighting_color(self) -> None:
         """Open a color chooser and apply the picked color to both elements."""
@@ -2042,6 +2156,22 @@ def main() -> int:
         "sidetone). These CHANGE device state via HID feature reports.",
     )
     parser.add_argument(
+        "--lighting-delay",
+        type=float,
+        default=LIGHT_SET_DELAY,
+        help="Pause between lighting SET reports in seconds (default: %.2f). "
+             "Raise it if color mixing reappears, lower it for snappier "
+             "changes." % LIGHT_SET_DELAY,
+    )
+    parser.add_argument(
+        "--lighting-reset-segments",
+        type=lambda s: int(s, 0),
+        default=LIGHT_RESET_SEGMENTS,
+        help="Lighting clearing pass: segments written per element before "
+             "the final 5-segment table (default: %d). Wipes stale colors "
+             "of earlier writes." % LIGHT_RESET_SEGMENTS,
+    )
+    parser.add_argument(
         "--no-notifications",
         action="store_true",
         help="Disable desktop notifications (low battery, dongle "
@@ -2062,6 +2192,8 @@ def main() -> int:
         enable_controls=args.enable_controls,
         notifications=(not args.no_notifications),
         notify_mute=args.notify_mute,
+        lighting_delay=args.lighting_delay,
+        lighting_reset_segments=args.lighting_reset_segments,
     )
     app.run()
     return 0

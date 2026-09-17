@@ -2,6 +2,42 @@
 
 ## Latest updates (2026-09-17)
 
+### RGB color mixups fixed (tray + `tools/jbl_rgb.py`)
+Diagnosed from the `ToDo.md` observations and fixed in both write paths:
+- **Dropped writes**: all lighting SET_REPORTs were sent back-to-back; the
+  ring's writes (last in the burst) could be dropped entirely, so "Pick a
+  color" only ever changed the logo. Every SET is now paced by ~20 ms
+  (`LIGHT_SET_DELAY` / `--delay`).
+- **Stale table segments**: the device keeps colors from earlier writes in
+  slots beyond the 5 QuantumENGINE-default segments (the factory table's
+  own index-2 segment is `ff 00 cc` = the "red residue" seen with
+  white/blue; "yellow -> white" was yellow blended with stale blue).
+  Every change now clears the table before the final table (the "reset
+  the colors before each change" recipe from the ToDo).
+- **Pulse tempo** (live test feedback): the `0x4c` segment count sets how
+  many segments share the tempo cycle - 16 identical segments pulsed
+  "super fast". The write is now two-pass: clearing pass (16 frames,
+  wipes stale colors) followed by the final QuantumENGINE-shape table
+  (5 frames = stock tempo) (`LIGHT_RESET_SEGMENTS` / `--reset-segments`,
+  final `--segments` default 5).
+- **Tray responsiveness** (live test feedback): the paced write sequence
+  blocked the GTK main loop (tray "very slow"/froze). The lighting write
+  now runs in a worker thread (busy-guarded, renders via `GLib.idle_add`).
+- **Change latency** (user feedback): the "very slow" was the delay until
+  the lighting reacts, not a freeze - every change re-ran the 12-GET
+  arming round and paced 48 SETs at 20 ms (~1.5 s until the commit).
+  Now the arming round is skipped while fresh (`LIGHT_ARM_TTL`, 60 s),
+  the per-SET pause is 10 ms (tunable via `--lighting-delay`) and rapid
+  menu clicks are coalesced (the newest color is queued and applied right
+  after the in-flight write instead of being dropped).
+- **Lights toggle race** (user feedback: "turn off doesn't register" +
+  rapid flashing): an in-flight lighting write committed lights-on at its
+  end, overriding toggles clicked during the write, and the device kept
+  playing the earlier 16-segment table (super-fast flashing). The toggle
+  now aborts the in-flight write (the toggle is authoritative) and logs
+  the `0x4a` read-back. Device state cleaned live: the stock 5-segment
+  factory table is re-written and cached, lights left off.
+
 ### Tray (`jbl_quantum910_tray.py`)
 - **Notifications** (`Notifier` class): desktop alerts on **low battery**
   (20/10/5 %, re-armed once the level climbs back above a threshold) and on

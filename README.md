@@ -161,6 +161,8 @@ The Quantum 810's lighting (logo + earcup ring) can be controlled from Linux
 via HID feature reports (`0x4c`/`0x4d` color table + `0x4b` commit). The
 protocol was decoded from QuantumENGINE USB captures and verified live on a
 Quantum 810 - full protocol map: `docs/HID_REPORTS.md` ("Lighting (RGB)").
+The tray's lighting write is tunable via `--lighting-delay` /
+`--lighting-reset-segments` (see the "Lighting" options below).
 
 Verified behavior:
 
@@ -191,17 +193,21 @@ python3 tools/jbl_rgb.py --raw "4c 00 64 05;4d 00 00 ff 00 00 02 00"  # raw feat
 ```
 
 Options: `--element logo|ring|both` (verified: element 0 = logo, 1 = ring),
-`--speed` (0x4c tempo byte, default `0x64`), `--mode` (0x4d interval marker,
-default `0x02` logo / `0x05` ring), `--lights on|off|keep` (state after the
-write, default `keep`) and `--listen SEC` (seconds to listen for `0x07` ACK
-events after a write).
+`--reset-segments N` (clearing pass before the final table, default 16;
+0 disables - wipes stale colors of earlier writes), `--segments N` (final
+table segments per element, default 5 = QuantumENGINE-exact tempo; higher
+counts pulse faster), `--speed` (0x4c tempo byte, default `0x64`),
+`--mode` (0x4d interval marker, default `0x02` logo / `0x05` ring),
+`--delay SEC` (pause between SETs, default 0.02 s - dropped-write guard),
+`--lights on|off|keep` (state after the write, default `keep`) and
+`--listen SEC` (seconds to listen for `0x07` ACK events after a write).
 
 ## Tools (helper scripts)
 
 The scripts below live in `tools/` and are useful for analysis/debugging:
 
 - `tools/jbl_status.py`: **full status reader** (battery, ANC, mic, game/chat mix, serial) with `--json`, `--watch` and control flags (`--set-anc`, `--set-lights`, `--set-sidetone`)
-- `tools/jbl_rgb.py`: **RGB lighting CLI** - `--status` (read-only probe), `--solid RRGGBB [--element logo|ring|both]`, `--default` (factory teal table), `--raw` hex sequences, `--speed`/`--mode` (0x4c tempo / 0x4d M-byte overrides), `--lights on|off|keep`, `--listen SEC`; performs the arming GET round automatically
+- `tools/jbl_rgb.py`: **RGB lighting CLI** - `--status` (read-only probe), `--solid RRGGBB [--element logo|ring|both]`, `--default` (factory teal table), `--raw` hex sequences, `--reset-segments N` + `--segments N` (two-pass write: clear table, then QuantumENGINE-exact 5-segment table), `--speed`/`--mode` (0x4c tempo / 0x4d M-byte overrides), `--delay SEC` (dropped-write guard), `--lights on|off|keep`, `--listen SEC`; performs the arming GET round automatically
 - `tools/jbl_status_probe.py`: **live protocol probe** (`--monitor` decodes event packets, `--features` watches feature reports, `--scan` sweeps all report IDs, `--correlate` guides you through verifying each action)
 - `tools/jbl_battery_auto.py`: auto-detects the dongle (910/810) and monitors the battery
 - `tools/jbl_battery_hidraw.py`: full dump/analysis (has `--log`)

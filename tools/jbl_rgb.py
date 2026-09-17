@@ -23,12 +23,25 @@ lights are on do not change the running effect. Each 4b toggle is ACKed
 by an 0x07 event (only on actual state changes). A solid color is
 expressed as 5 identical segments and renders as a breathing-style pulse.
 
+Two live-verified pitfalls cause the "color mixups":
+  - SETs sent back-to-back can be DROPPED by the dongle/2.4 GHz link (the
+    ring's writes - last in the burst - went missing entirely). Every SET
+    is therefore paced by WRITE_DELAY seconds (--delay).
+  - The device table keeps colors from earlier writes beyond the 5 written
+    segments ("residue"). --solid therefore writes TWO passes: a clearing
+    pass of --reset-segments identical frames (default 16, wipes every
+    slot), then the final QuantumENGINE-shape table (--segments, default
+    5). The 0x4c segment count also sets how many segments share the
+    tempo cycle - counts above 5 pulse visibly faster ("super fast"),
+    so the final table stays at 5.
+
 CHANGES DEVICE STATE: colors persist until overwritten (QuantumENGINE on
 Windows can always restore them; `--default` replays the factory table).
 
 Examples:
     python3 tools/jbl_rgb.py --status                 # read-only probe
     python3 tools/jbl_rgb.py --solid ff0000 --lights on
+    python3 tools/jbl_rgb.py --solid ff0000 --reset-segments 32   # wider clear
     python3 tools/jbl_rgb.py --solid 00ffcc --element logo --lights keep
     python3 tools/jbl_rgb.py --default --lights off   # factory teal + lights off
     python3 tools/jbl_rgb.py --raw "4c 00 64 05;4d 00 00 ff 00 00 02 00"
@@ -54,7 +67,14 @@ from jbl_status import (  # noqa: E402
 FEAT_TABLE_HEADER = 0x4C  # SET: [0x4c, element, tempo, segment_count]
 FEAT_TABLE_FRAME = 0x4D  # SET: [0x4d, element, index, R, G, B, M, index*2]
 FEAT_SET_LIGHTS = 0x4B    # SET: [0x4b, 0=off/1=on] (known)
-FRAME_COUNT = 5
+FRAME_COUNT = 5           # QuantumENGINE default segments per element
+RESET_SEGMENTS = 16       # clearing-pass slots per element (see --reset-segments)
+# Pause after each lighting SET_REPORT (pacing, live-verified need): the
+# dongle relays the writes to the headset over its 2.4 GHz link and drops
+# reports sent back-to-back (the ring's writes - last in the burst - went
+# missing entirely; partially delivered tables leave stale colors cycling).
+# 10 ms keeps a change snappy; raise it (--delay) if mixing reappears.
+WRITE_DELAY = 0.01
 # Lighting elements (verified live): 0 = logo, 1 = ring.
 ELEMENTS = {"logo": 0, "ring": 1}
 ZONES = (0, 1)
@@ -79,12 +99,20 @@ def _hexs(data: bytes) -> str:
     return " ".join(f"{b:02x}" for b in data)
 
 
-def set_feature_bytes(reader: JblStatusReader, data: bytes) -> bool:
-    """SET_REPORT(Feature, data) with data[0] = report ID. CHANGES DEVICE STATE."""
+def set_feature_bytes(reader: JblStatusReader, data: bytes,
+                      delay: float = WRITE_DELAY) -> bool:
+    """SET_REPORT(Feature, data) with data[0] = report ID. CHANGES DEVICE STATE.
+
+    Paces the write with a short pause afterwards: lighting SETs fired
+    back-to-back can be dropped by the dongle/2.4 GHz link (live-verified:
+    the ring's writes - last in the burst - went missing).
+    """
     if reader._fd is None:
         return False
     try:
         fcntl.ioctl(reader._fd, _HIDIOCSFEATURE | (len(data) << 16), bytes(data), True)
+        if delay > 0:
+            time.sleep(delay)
         return True
     except OSError as e:
         print(f"SET feature 0x{data[0]:02x} failed: {e}", file=sys.stderr)
@@ -106,19 +134,27 @@ def arm_lighting(reader: JblStatusReader) -> bool:
 
 
 def send_table(reader: JblStatusReader, frames: dict, speed: int = FACTORY_SPEED,
-               modes: dict | None = None, lights: str = "keep") -> bool:
-    """Write the per-element color table using the QuantumENGINE sequence."""
+               modes: dict | None = None, lights: str = "keep",
+               segments: int = RESET_SEGMENTS, delay: float = WRITE_DELAY) -> bool:
+    """Write the per-element color table using the QuantumENGINE sequence.
+
+    `segments` frames are written per zone; `frames[zone]` supplies the
+    colors (cycled when shorter). Writing MORE than the 5 QuantumENGINE
+    default segments overwrites the whole device table - a reset that
+    clears stale segments from earlier writes (the color mixups).
+    """
     modes = modes or FACTORY_MODES
     for zone in ZONES:
         if zone not in frames:
             continue
-        header = bytes([FEAT_TABLE_HEADER, zone, speed, FRAME_COUNT])
-        if not set_feature_bytes(reader, header):
+        header = bytes([FEAT_TABLE_HEADER, zone, speed, segments])
+        if not set_feature_bytes(reader, header, delay):
             return False
         print(f"  SET 0x4c zone {zone}: {_hexs(header)}")
-        for i, (r, g, b) in enumerate(frames[zone]):
+        for i in range(segments):
+            r, g, b = frames[zone][i % len(frames[zone])]
             frame = bytes([FEAT_TABLE_FRAME, zone, i, r, g, b, modes.get(zone, 0x02), i * 2])
-            if not set_feature_bytes(reader, frame):
+            if not set_feature_bytes(reader, frame, delay):
                 return False
     if lights == "on":
         ok = reader.set_lights(True)
@@ -193,8 +229,8 @@ def main() -> int:
     ap.add_argument("--status", action="store_true",
                     help="read-only probe: known state + 0x4c/0x4d/0x4e GET attempts")
     ap.add_argument("--solid", metavar="RRGGBB",
-                    help="single color (breathing effect) written as 5 identical "
-                         "segments - CHANGES DEVICE STATE")
+                    help="single color (breathing effect) written as --segments "
+                         "identical segments - CHANGES DEVICE STATE")
     ap.add_argument("--element", choices=["logo", "ring", "both"], default="both",
                     help="lighting element for --solid (default both; verified: "
                          "element 0 = logo, 1 = ring)")
@@ -207,6 +243,20 @@ def main() -> int:
                     help="speed byte for the 0x4c header (default 0x64; capture also shows 0x32)")
     ap.add_argument("--mode", type=lambda s: int(s, 0), default=None,
                     help="M byte for the 0x4d frames (default: 0x02 zone 0 / 0x05 zone 1)")
+    ap.add_argument("--segments", type=lambda s: int(s, 0), default=FRAME_COUNT,
+                    metavar="N",
+                    help=f"final 0x4d table segments per element (default "
+                         f"{FRAME_COUNT}, QuantumENGINE-exact tempo; higher "
+                         "counts share the tempo cycle and pulse visibly "
+                         "faster)")
+    ap.add_argument("--reset-segments", type=lambda s: int(s, 0),
+                    default=RESET_SEGMENTS, metavar="N",
+                    help=f"clearing pass: overwrite N slots per element before "
+                         f"the final table (default {RESET_SEGMENTS}; 0 "
+                         "disables - clears stale colors of earlier writes)")
+    ap.add_argument("--delay", type=float, default=WRITE_DELAY, metavar="SEC",
+                    help=f"pause between SET reports (default {WRITE_DELAY}s; "
+                         "raise it if writes are still dropped)")
     ap.add_argument("--lights", choices=["on", "off", "keep"], default="keep",
                     help="after writing a table: turn lights on/off or leave as-is (default keep)")
     ap.add_argument("--listen", type=float, default=3.0, metavar="SEC",
@@ -243,25 +293,51 @@ def main() -> int:
                 raise SystemExit("--solid expects RRGGBB, e.g. ff0000")
             r, g, b = rgb[0], rgb[1], rgb[2]
             wanted = {"logo": (0,), "ring": (1,), "both": ZONES}[args.element]
-            frames = {element: [(r, g, b)] * FRAME_COUNT for element in wanted}
             modes = ({0: args.mode, 1: args.mode} if args.mode is not None else FACTORY_MODES)
-            print(f"writing color #{args.solid.upper()} (R={r} G={g} B={b}) "
-                  f"to element(s): {args.element}:")
-            ok = send_table(reader, frames, speed=(args.speed or FACTORY_SPEED),
-                            modes=modes, lights=args.lights)
+            speed = (args.speed if args.speed is not None else FACTORY_SPEED)
+            ok = True
+            if args.reset_segments:
+                # Clearing pass: overwrite every slot with the new color
+                # (stale colors from earlier writes otherwise keep cycling),
+                # then the final table restores the QuantumENGINE shape.
+                clear = {element: [(r, g, b)] * args.reset_segments
+                         for element in wanted}
+                print(f"reset pass: {args.reset_segments} segments per element:")
+                ok = send_table(reader, clear, speed=speed, modes=modes,
+                                lights="keep", segments=args.reset_segments,
+                                delay=args.delay)
+            if ok:
+                frames = {element: [(r, g, b)] * args.segments
+                          for element in wanted}
+                print(f"writing color #{args.solid.upper()} (R={r} G={g} B={b}) "
+                      f"to element(s): {args.element} ({args.segments} segments):")
+                ok = send_table(reader, frames, speed=speed,
+                                modes=modes, lights=args.lights,
+                                segments=args.segments, delay=args.delay)
             print(f"table write: {'OK' if ok else 'FAILED'}")
 
         if args.default:
             print("writing factory table (teal 33 ff cc, speed 0x64):")
-            ok = send_table(reader, FACTORY_FRAMES, speed=FACTORY_SPEED,
-                            modes=FACTORY_MODES, lights=args.lights)
+            ok = True
+            if args.reset_segments:
+                clear = {zone: [FACTORY_FRAMES[zone][i % len(FACTORY_FRAMES[zone])]
+                                for i in range(args.reset_segments)]
+                         for zone in ZONES}
+                print(f"reset pass: {args.reset_segments} segments per element:")
+                ok = send_table(reader, clear, speed=FACTORY_SPEED,
+                                modes=FACTORY_MODES, lights="keep",
+                                segments=args.reset_segments, delay=args.delay)
+            if ok:
+                ok = send_table(reader, FACTORY_FRAMES, speed=FACTORY_SPEED,
+                                modes=FACTORY_MODES, lights=args.lights,
+                                segments=args.segments, delay=args.delay)
             print(f"table write: {'OK' if ok else 'FAILED'}")
 
         if args.raw:
             reports = parse_hex_sequence(args.raw)
             print(f"sending {len(reports)} raw feature reports:")
             for rep in reports:
-                ok = set_feature_bytes(reader, rep)
+                ok = set_feature_bytes(reader, rep, args.delay)
                 print(f"  SET 0x{rep[0]:02x} ({len(rep)}B): {_hexs(rep)}  "
                       f"{'ok' if ok else 'FAILED'}")
 

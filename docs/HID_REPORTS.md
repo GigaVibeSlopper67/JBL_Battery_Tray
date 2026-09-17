@@ -114,6 +114,15 @@ Verified behavior (live on a Quantum 810 via hidraw):
   dongle applies the cached table at the next off->on cycle.
 - **ACKs**: `0x4b` toggles are ACKed by `0x07` events, but only on actual
   state changes (a redundant `4b 01` while already on produces no event).
+- **Toggle vs table-write race** (live, 2026-09-17): a lighting write ends
+  with its own lights-on commit, which silently re-lights the headset even
+  when the user toggled the lights off during the write. The tray aborts an
+  in-flight write when the lights are toggled off (checks between reports,
+  never commits afterwards) so the toggle stays authoritative. Also seen
+  once after a wedged 16-segment table: a `4b 00` was accepted without a
+  `07` ACK and the `0x4a` read-back answered a 4-byte payload
+  (`4a 00 00 02`) instead of the usual 2-byte `[4a, state]` - replug /
+  power-cycle recovers the lighting controller.
 - **Element mapping**: element 0 = logo, element 1 = ring (verified live
   with distinct colors per element).
 - **No read-back**: GET on `0x4c`/`0x4d`/`0x4e` answers with the nearest
@@ -121,36 +130,64 @@ Verified behavior (live on a Quantum 810 via hidraw):
   cannot be read back. QuantumENGINE also only ever pushes it.
 - A solid color = 5 identical segments and renders as a breathing-style
   pulse (a true steady "Solid" encoding is still open, see below).
+- **Color mixups diagnosed** (live, 2026-09-17): SETs fired back-to-back
+  can be dropped outright (the ring's writes, last in the burst, went
+  missing entirely) and partially delivered tables leave stale colors
+  cycling (the factory table's index-2 segment is `ff 00 cc` = the "red
+  residue" seen with white/blue; "yellow rendering white" is the new
+  yellow blended with a stale blue residue). Remedy used by the tray and
+  `tools/jbl_rgb.py`: pace every SET (`--delay`, tray `LIGHT_SET_DELAY`)
+  and clear the table before the final table (two passes: clearing frames
+  first, then the QuantumENGINE-shape table).
+- **Segment count = pulse tempo** (live, 2026-09-17): the `0x4c` segment
+  count sets how many segments share the tempo cycle - a 16-segment table
+  pulsed visibly "super fast". The final table therefore stays at the
+  stock 5; only the clearing pass uses more frames (tray
+  `LIGHT_RESET_SEGMENTS`, CLI `--reset-segments`).
 
 Open questions (not yet decoded):
 
-- Exact meaning of the `M` byte (interval length in tempo units?) and of
-  the `0x4c` 4th byte (segment count vs effect ID - `01`/`04` variants
-  were tried with unclear results).
+- Exact meaning of the `M` byte (interval length in tempo units?). The
+  `0x4c` 4th byte behaves as the segment count: the played segments share
+  the tempo cycle (live: 5 = stock pulse, 16 = visibly faster pulse);
+  whether it can also act as an effect ID is still open.
 - How "Solid"/"Wave"/"Glitch" effects are encoded (other header values,
   other reports, or tempo `0x00`?).
-- Why later table writes only partially replace segments (colors from
-  older writes can persist in the cycle) - possibly a rolling segment
-  queue rather than a fixed table.
 - The minimal arming GET (the full round is used as the safe recipe).
 
 ### Controlling the lighting from Linux
 
 Both implementations arm automatically (the 12-request GET round above),
 then write the per-element table and toggle the lights to trigger the
-off->on apply cycle:
+off->on apply cycle. Three guards fix the color mixups (diagnosed live,
+2026-09-17): every SET_REPORT is paced (~10 ms - back-to-back writes were
+dropped, the ring's writes went missing entirely); a clearing pass
+overwrites the whole table (16 identical segments per element - stale
+colors from earlier writes otherwise keep cycling); and the final table
+stays at the QuantumENGINE-exact 5 segments (the count byte sets how many
+segments share the tempo cycle - higher counts pulse faster). The tray
+runs the whole sequence on a worker thread so the UI never blocks; it
+skips re-arming while fresh (`LIGHT_ARM_TTL`, 60 s) and coalesces rapid
+color clicks (newest color wins):
 
 - **Tray** (`--enable-controls`): menu -> Lighting -> "Pick color…" (GTK
   color chooser) or the presets Red/Green/Blue/White/Teal (factory).
-  Applies one color to both elements (logo + ring).
+  Applies one color to both elements (logo + ring) as a paced two-pass
+  write (`LIGHT_RESET_SEGMENTS` + `LIGHT_SEGMENTS`, `LIGHT_SET_DELAY`).
 - **CLI** `tools/jbl_rgb.py`:
   - `--status` - read-only probe (state + `0x4c`/`0x4d`/`0x4e` GET attempts)
-  - `--solid RRGGBB [--element logo|ring|both]` - one color as 5 identical
-    segments (breathing-style effect)
+  - `--solid RRGGBB [--element logo|ring|both]` - clearing pass plus one
+    color as `--segments` identical segments (breathing-style effect)
   - `--default` - replay the factory teal table (`33 ff cc`, tempo `0x64`)
+  - `--reset-segments N` - clearing pass before the final table (default
+    16; 0 disables - wipes stale colors of earlier writes)
+  - `--segments N` - final table segments per element (default 5,
+    QuantumENGINE-exact tempo; higher counts pulse faster)
   - `--speed N` - override the `0x4c` tempo byte (default `0x64`; captures
     also show `0x32`)
   - `--mode N` - override the `0x4d` M byte (default `0x02` logo / `0x05` ring)
+  - `--delay SEC` - pause between SET reports (default 0.02; raise it if
+    writes are still dropped)
   - `--lights on|off|keep` - lights state after the write (default `keep`)
   - `--listen SEC` - seconds to listen for `0x07` ACK events after a SET
   - `--raw "4c 00 64 05;4d 00 00 ff 00 00 02 00"` - send raw feature reports
