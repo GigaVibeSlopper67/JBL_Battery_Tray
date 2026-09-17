@@ -4,6 +4,11 @@ Attention Attention! This is AI Chudslop, use at own risk xD
 
 **Real** battery monitor for the JBL Quantum910 and Quantum810: shows the **battery % in the tray** and can start automatically at login via **`systemd --user`**.
 
+Experimental Features:
+- RGB control (has some bugs)
+- Control Sidetone
+- Cycle ANC
+
 The confirmed battery pattern for this headset is:
 
 ```
@@ -30,7 +35,7 @@ The confirmed battery pattern for this headset is:
 - **`jbl_battery_simple.py`**: CLI battery monitor (pyusb)
 - **`check_permissions.sh`**: verifies device access, udev rules and Python libraries
 - **`setup_udev_rules.sh`**: installs the udev rules (no plugdev group needed)
-- **`install.sh` / `uninstall.sh`**: installs/removes as a login service
+- **`install.sh` / `uninstall.sh`**: installs/removes as a login service Use --enable-controls flag to enable experimental control features.
 - **`systemd/`**: `systemd --user` unit file
 - **`autostart/`**: alternative via `.desktop`
 - **`tools/`**: auxiliary/experimental capture/analysis scripts
