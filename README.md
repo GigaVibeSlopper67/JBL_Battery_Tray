@@ -1,6 +1,12 @@
 # JBL Quantum 910/810 Battery Tray (Linux)
 
-Attention Attention! This is AI Chudslop, use at own risk xD
+> [!WARNING] 
+> Attention Attention! This is AI Generated code and findings, use at own risk. 
+> I am just putting together some personal tools for myself.
+> You can take my findings, i.e. the adresses and put them somewhere to legit use though. 
+> I had the audacity to start this without any pcaps. It wedged my RBG MCU at some point by sending way 
+> too many RGB segments and it can't unwedge by replug like with the Razer Barracuda Pro. 
+> It is stuck in a strobe. The Values are clamped to their max now, so the findings should be safe.
 
 **Real** battery monitor for the JBL Quantum910 and Quantum810: shows the **battery % in the tray** and can start automatically at login via **`systemd --user`**.
 
