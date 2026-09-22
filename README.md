@@ -208,12 +208,25 @@ table segments per element, default 5 = QuantumENGINE-exact), `--speed`
 write, default `keep`) and `--listen SEC` (seconds to listen for `0x07` ACK
 events after a write).
 
-> **Safe value ranges** (from the original QuantumENGINE USB capture in
-> `pcaps/`): segment counts are **2 or 5 only**, the tempo byte is
-> **`0x28`/`0x32`/`0x64`**, and the `0x4d` M byte is
-> **`0x00`/`0x01`/`0x02`/`0x04`/`0x05`**. The CLI and tray now **hard-clamp**
-> every value to these ranges — segment counts above 5 (the old 16/32-segment
-> "reset") wedge the lighting MCU and lock the RGB into a strobe.
+> ### ⚠️ RGB value ranges - do NOT exceed these (can brick the lighting)
+>
+> From the original QuantumENGINE USB capture (`pcaps/`), the only values the
+> software ever sends are:
+>
+> | Field | Safe range |
+> |-------|------------|
+> | `0x4c` segment count | **2 or 5** (never more than 5) |
+> | `0x4c` tempo byte | **`0x28` / `0x32` / `0x64`** |
+> | `0x4d` frame index | **0–4** |
+> | `0x4d` last byte | **0–8** (`index*2`) |
+> | `0x4d` M byte | **`0x00` / `0x01` / `0x02` / `0x04` / `0x05`** |
+>
+> Writing outside these ranges (e.g. a segment count of 16 or 32) **deadlocks
+> the lighting MCU into a strobe** and is **not** recoverable by factory reset
+> or a normal power-off - the lighting ignores all further writes, even from
+> QuantumENGINE, and a firmware update may fail to complete. The CLI and tray
+> now **hard-clamp every value** to these ranges to make this impossible.
+> Full details and recovery notes: `docs/RGB_SAFE_RANGES.md`.
 
 ## Tools (helper scripts)
 

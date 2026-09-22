@@ -106,6 +106,28 @@ sequence of color **segments** whose interval distribution follows a
 > 16/32-segment "reset") wedge the lighting MCU into a strobe lockup. The
 > tray and `tools/jbl_rgb.py` hard-clamp every value to these ranges.
 
+### ⚠️ Deadlock warning - do NOT exceed the safe ranges
+
+Writing a value **outside the ranges above can permanently deadlock the RGB
+lighting** and is **not recoverable by factory reset or a normal power-off**:
+
+- The lighting runs on a **separate MCU** that latches bad table values into
+  a tight loop (the "absurd strobe") and then **ignores all further writes** -
+  including from QuantumENGINE on Windows.
+- The trigger observed in this project was a **segment count above 5** (a
+  "clearing pass" of 16 or 32 segments). The extra frames pushed the `0x4d`
+  index to 0..15/31 and the last byte to `0x1e`/`0x3e`, far outside the
+  device's 0..4 / 0..8.
+- Once wedged, a soft reset (power button, dongle replug, factory reset) does
+  **not** clear it because none of those hard-cut power to the lighting MCU.
+  A firmware update may also fail to complete. Recovery requires a true cold
+  boot (full battery drain to zero, or physically disconnecting the battery)
+  or a wired reflash - see `docs/RGB_SAFE_RANGES.md`.
+
+**Rule for any implementation:** never emit a value that QuantumENGINE itself
+does not emit. The safe set above is the complete observed set; treat
+everything else as untested and potentially device-bricking.
+
 Verified behavior (live on a Quantum 810 via hidraw):
 
 - **Arming required**: the lighting SETs only take effect after the
@@ -157,26 +179,26 @@ Open questions (not yet decoded):
 
 - Exact meaning of the `M` byte (interval length in tempo units?). The
   `0x4c` 4th byte behaves as the segment count: the played segments share
-  the tempo cycle (live: 5 = stock pulse, 16 = visibly faster pulse);
-  whether it can also act as an effect ID is still open.
+  the tempo cycle (live: 5 = stock pulse). Whether it can also act as an
+  effect ID is still open - but values above 5 wedge the MCU, so any
+  experiment must stay within 1..5.
 - How "Solid"/"Wave"/"Glitch" effects are encoded (other header values,
   other reports, or tempo `0x00`?).
 - The minimal arming GET (the full round is used as the safe recipe).
 
 ### Controlling the lighting from Linux
 
-Both implementations arm automatically (the 12-request GET round above),
-then write the per-element table and toggle the lights to trigger the
-off->on apply cycle. Three guards fix the color mixups (diagnosed live,
-2026-09-17): every SET_REPORT is paced (~10 ms - back-to-back writes were
-dropped, the ring's writes went missing entirely); a clearing pass
-overwrites the whole table (16 identical segments per element - stale
-colors from earlier writes otherwise keep cycling); and the final table
-stays at the QuantumENGINE-exact 5 segments (the count byte sets how many
-segments share the tempo cycle - higher counts pulse faster). The tray
-runs the whole sequence on a worker thread so the UI never blocks; it
-skips re-arming while fresh (`LIGHT_ARM_TTL`, 60 s) and coalesces rapid
-color clicks (newest color wins):
+Both implementations arm automatically (the GET round above), then write
+the per-element table and toggle the lights to trigger the off->on apply
+cycle. Three guards fix the color mixups (diagnosed live, 2026-09-17):
+every SET_REPORT is paced (~10 ms - back-to-back writes were dropped, the
+ring's writes went missing entirely); a clearing pass overwrites the whole
+table (identical segments per element - stale colors from earlier writes
+otherwise keep cycling); and every value is hard-clamped to the safe ranges
+derived from the QuantumENGINE capture (segments 1..5, tempo 0x28/0x32/0x64,
+M 0x00/0x01/0x02/0x04/0x05). The tray runs the whole sequence on a worker
+thread so the UI never blocks; it skips re-arming while fresh
+(`LIGHT_ARM_TTL`, 60 s) and coalesces rapid color clicks (newest color wins):
 
 - **Tray** (`--enable-controls`): menu -> Lighting -> "Pick color…" (GTK
   color chooser) or the presets Red/Green/Blue/White/Teal (factory).
@@ -187,18 +209,21 @@ color clicks (newest color wins):
   - `--solid RRGGBB [--element logo|ring|both]` - clearing pass plus one
     color as `--segments` identical segments (breathing-style effect)
   - `--default` - replay the factory teal table (`33 ff cc`, tempo `0x64`)
-  - `--reset-segments N` - clearing pass before the final table (default
-    16; 0 disables - wipes stale colors of earlier writes)
-  - `--segments N` - final table segments per element (default 5,
-    QuantumENGINE-exact tempo; higher counts pulse faster)
-  - `--speed N` - override the `0x4c` tempo byte (default `0x64`; captures
-    also show `0x32`)
-  - `--mode N` - override the `0x4d` M byte (default `0x02` logo / `0x05` ring)
+  - `--reset-segments N` - clearing pass before the final table (default 5,
+    clamped to 1..5; 0 disables - wipes stale colors of earlier writes)
+  - `--segments N` - final table segments per element (default 5, clamped
+    to 1..5 - QuantumENGINE never sends more than 5)
+  - `--speed N` - override the `0x4c` tempo byte (default `0x64`; clamped to
+    `0x28`/`0x32`/`0x64`)
+  - `--mode N` - override the `0x4d` M byte (default `0x02` logo / `0x05`
+    ring; clamped to `0x00`/`0x01`/`0x02`/`0x04`/`0x05`)
   - `--delay SEC` - pause between SET reports (default 0.02; raise it if
     writes are still dropped)
   - `--lights on|off|keep` - lights state after the write (default `keep`)
   - `--listen SEC` - seconds to listen for `0x07` ACK events after a SET
   - `--raw "4c 00 64 05;4d 00 00 ff 00 00 02 00"` - send raw feature reports
+    (**NOT clamped** - bypasses every safety guard and can wedge the lighting
+    MCU; use only with values from the safe-ranges table above)
 
 ## What is NOT (yet) monitorable
 
