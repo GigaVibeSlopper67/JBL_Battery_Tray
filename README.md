@@ -1,4 +1,4 @@
-# JBL Quantum 910/810 Battery Tray (Linux)
+# JBL Quantum 910/810 Battery and Tool Tray (Linux)
 
 > [!WARNING] 
 > Attention Attention! This is AI Generated code and findings, use at own risk. 

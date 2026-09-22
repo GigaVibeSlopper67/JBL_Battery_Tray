@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-JBL Quantum 910/810 - Tray Battery Monitor (Linux)
+JBL Quantum 910/810 - Tray Battery Monitor and tools (Linux)
 
 - Shows headset battery percentage in the system tray (AppIndicator).
 - Reads battery primarily via hidraw (least intrusive).
