@@ -96,3 +96,16 @@ Round 4 (2026-09-17, "turn off doesn't register" + rapid flashing):
   dongle (QuantumENGINE polling or our GET polling) can wake/keep the
   headset alive - to power it off, unplug the dongle first, then hold
   power 15-30 s.
+
+---
+
+Round 5 (2026-09-23, after parsing the original QuantumENGINE capture in
+`pcaps/`): the RGB lockup / strobe was caused by the 16/32-segment
+"clearing pass". The capture shows QuantumENGINE only ever sends **2 or 5**
+segments, tempo **0x28/0x32/0x64**, frame index **0..4**, last byte **0..8**,
+and M byte **0x00/0x01/0x02/0x04/0x05**. The code now hard-clamps every
+lighting value to these ranges (`MAX_SEGMENTS` / `LIGHT_MAX_SEGMENTS`,
+`SAFE_TEMPOS` / `LIGHT_SAFE_TEMPOS`, `SAFE_MODES` / `LIGHT_SAFE_MODES`),
+and the `LIGHT_RESET_SEGMENTS` / `RESET_SEGMENTS` defaults dropped from 16
+to 5. The arming GET round was also aligned to the captured order
+(`0x68, 0x67, 0x62, 0x5c, 0x75, 0x49, 0x51, 0x47, 0x4a, 0x45`).

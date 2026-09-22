@@ -193,14 +193,21 @@ python3 tools/jbl_rgb.py --raw "4c 00 64 05;4d 00 00 ff 00 00 02 00"  # raw feat
 ```
 
 Options: `--element logo|ring|both` (verified: element 0 = logo, 1 = ring),
-`--reset-segments N` (clearing pass before the final table, default 16;
+`--reset-segments N` (clearing pass before the final table, default 5;
 0 disables - wipes stale colors of earlier writes), `--segments N` (final
-table segments per element, default 5 = QuantumENGINE-exact tempo; higher
-counts pulse faster), `--speed` (0x4c tempo byte, default `0x64`),
-`--mode` (0x4d interval marker, default `0x02` logo / `0x05` ring),
-`--delay SEC` (pause between SETs, default 0.02 s - dropped-write guard),
-`--lights on|off|keep` (state after the write, default `keep`) and
-`--listen SEC` (seconds to listen for `0x07` ACK events after a write).
+table segments per element, default 5 = QuantumENGINE-exact), `--speed`
+(0x4c tempo byte, default `0x64`), `--mode` (0x4d interval marker, default
+`0x02` logo / `0x05` ring), `--delay SEC` (pause between SETs, default
+0.02 s - dropped-write guard), `--lights on|off|keep` (state after the
+write, default `keep`) and `--listen SEC` (seconds to listen for `0x07` ACK
+events after a write).
+
+> **Safe value ranges** (from the original QuantumENGINE USB capture in
+> `pcaps/`): segment counts are **2 or 5 only**, the tempo byte is
+> **`0x28`/`0x32`/`0x64`**, and the `0x4d` M byte is
+> **`0x00`/`0x01`/`0x02`/`0x04`/`0x05`**. The CLI and tray now **hard-clamp**
+> every value to these ranges — segment counts above 5 (the old 16/32-segment
+> "reset") wedge the lighting MCU and lock the RGB into a strobe.
 
 ## Tools (helper scripts)
 

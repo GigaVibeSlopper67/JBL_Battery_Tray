@@ -63,25 +63,34 @@ LOW_BATTERY_LEVELS = (20, 10, 5)
 # The lighting SETs only take effect after the QuantumENGINE connect-time
 # GET round ("arming"): without it the dongle caches the SETs but the
 # headset ignores them. Arming persists for at least several minutes.
-LIGHT_ARM_GET_RIDS = (0x50, 0x68, 0x51, 0x45, 0x67, 0x68, 0x5C, 0x62,
-                      0x49, 0x47, 0x4A, 0x5B)
+LIGHT_ARM_GET_RIDS = (0x68, 0x67, 0x62, 0x5C, 0x75, 0x49,
+                      0x51, 0x47, 0x4A, 0x45)
 FEAT_LIGHT_HEADER = 0x4C  # SET: [0x4c, element, tempo, segments]
 FEAT_LIGHT_FRAME = 0x4D  # SET: [0x4d, element, index, R, G, B, M, index*2]
 LIGHT_ELEMENTS = (0, 1)  # element 0 = logo, element 1 = ring (verified live)
 LIGHT_SEGMENTS = 5       # color segments per element (QuantumENGINE default)
-LIGHT_TEMPO = 0x64       # tempo byte (0x32/0x64 observed = slider value)
+LIGHT_MAX_SEGMENTS = 5   # hard cap (QuantumENGINE capture: only 2 or 5 ever sent)
+LIGHT_TEMPO = 0x64       # tempo byte (0x28/0x32/0x64 observed = slider value)
 LIGHT_MODES = {0: 0x02, 1: 0x05}  # per-segment interval marker (M byte)
+# Value ranges observed in the original QuantumENGINE USB capture (pcaps/).
+# Anything outside these wedged the lighting MCU into a strobe lockup (the old
+# 16-segment "reset" is what broke it): segment counts are 2 or 5 only, tempo
+# is 0x28/0x32/0x64, and the 0x4d M byte is 0x00/0x01/0x02/0x04/0x05. The frame
+# index stays 0..4 and the last byte 0..8 (index*2), implied by segments <= 5.
+LIGHT_SAFE_TEMPOS = (0x28, 0x32, 0x64)
+LIGHT_SAFE_MODES = (0x00, 0x01, 0x02, 0x04, 0x05)
 # Lighting write recipe (live-tuned): (1) pace every SET_REPORT - writes
 # fired back-to-back can be dropped by the dongle/2.4 GHz link (live: the
 # ring's writes - last in the burst - went missing entirely); (2) clear the
 # whole table with LIGHT_RESET_SEGMENTS identical frames (stale colors from
 # earlier changes otherwise keep cycling - "red with a blue tail",
-# "yellow rendering white"); (3) write the final LIGHT_SEGMENTS table -
-# the 0x4c segment count sets how many segments share the tempo cycle, so
-# counts above 5 pulse visibly faster (live: 16 pulsed "super fast").
+# "yellow rendering white"); (3) write the final LIGHT_SEGMENTS table. All
+# segment counts are hard-clamped to <= LIGHT_MAX_SEGMENTS: the QuantumENGINE
+# capture only ever sends 2 or 5, and counts above 5 wedge the lighting MCU
+# into a strobe lockup (live: the old 16-segment "reset" is what broke it).
 # 10 ms per SET keeps a color change snappy (~0.5 s to the commit); if
 # color mixing ever reappears, raise the delay (--lighting-delay).
-LIGHT_RESET_SEGMENTS = 16
+LIGHT_RESET_SEGMENTS = 5
 LIGHT_SET_DELAY = 0.01
 # The arming GET round only has to run once in a while: the armed state
 # persists for at least several minutes (verified), so repeated changes
@@ -264,14 +273,34 @@ def build_lighting_reports(color: tuple, element: int = 0, tempo: int = LIGHT_TE
     Returns the report payloads in send order: one 0x4c header followed by
     `segments` 0x4d frames. The sequence only takes effect after the
     LIGHT_ARM_GET_RIDS GET round and a lights off->on transition.
+
+    Segment count, tempo and M byte are hard-clamped to the ranges observed
+    in the QuantumENGINE capture (pcaps/): 1..5 segments, tempo
+    0x28/0x32/0x64, M 0x00/0x01/0x02/0x04/0x05. Counts above 5 wedge the
+    lighting MCU (the old 16-segment "reset" locked the RGB into a strobe).
     """
     r, g, b = color
+    segments = max(1, min(int(segments), LIGHT_MAX_SEGMENTS))
+    tempo = _clamp_light_tempo(tempo)
     if mode is None:
         mode = LIGHT_MODES.get(element, 0x02)
+    mode = _clamp_light_mode(mode)
     reports = [bytes([FEAT_LIGHT_HEADER, element, tempo, segments])]
     for i in range(segments):
         reports.append(bytes([FEAT_LIGHT_FRAME, element, i, r, g, b, mode, i * 2]))
     return reports
+
+
+def _clamp_light_tempo(tempo: int) -> int:
+    """Clamp the 0x4c tempo byte to the values QuantumENGINE actually sends."""
+    tempo = int(tempo)
+    return tempo if tempo in LIGHT_SAFE_TEMPOS else min(LIGHT_SAFE_TEMPOS, key=lambda v: abs(v - tempo))
+
+
+def _clamp_light_mode(mode: int) -> int:
+    """Clamp the 0x4d M byte to the values QuantumENGINE actually sends."""
+    mode = int(mode)
+    return mode if mode in LIGHT_SAFE_MODES else min(LIGHT_SAFE_MODES, key=lambda v: abs(v - mode))
 
 
 def _log(msg: str) -> None:
@@ -1627,9 +1656,9 @@ class BatteryTrayApp:
                     break
             if not ok:
                 break
-        # Final pass: QuantumENGINE-shape table - the 0x4c segment count
-        # sets how many segments share the tempo cycle, so counts above
-        # the stock 5 pulse visibly faster.
+        # Final pass: QuantumENGINE-shape table (5 segments - the capture
+        # shows QuantumENGINE only ever sends 2 or 5; counts above 5 wedge
+        # the lighting MCU, and build_lighting_reports clamps to <= 5).
         if ok and not self._lighting_abort:
             for element in LIGHT_ELEMENTS:
                 for rep in build_lighting_reports((r, g, b), element,
@@ -2165,11 +2194,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--lighting-reset-segments",
-        type=lambda s: int(s, 0),
+        type=lambda s: 0 if int(s, 0) == 0 else max(1, min(int(s, 0), LIGHT_MAX_SEGMENTS)),
         default=LIGHT_RESET_SEGMENTS,
         help="Lighting clearing pass: segments written per element before "
-             "the final 5-segment table (default: %d). Wipes stale colors "
-             "of earlier writes." % LIGHT_RESET_SEGMENTS,
+             "the final 5-segment table (default: %d, clamped to 1..%d; 0 "
+             "disables). QuantumENGINE never sends more than 5 - higher "
+             "counts wedge the lighting MCU."
+             % (LIGHT_RESET_SEGMENTS, LIGHT_MAX_SEGMENTS),
     )
     parser.add_argument(
         "--no-notifications",

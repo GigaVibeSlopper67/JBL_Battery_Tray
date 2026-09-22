@@ -95,17 +95,23 @@ sequence of color **segments** whose interval distribution follows a
 
 | Report | Payload | Meaning |
 |--------|---------|---------|
-| `0x4c` | `[4c, element, tempo, segments]` | table header; tempo seen: `0x32`/`0x64` (slider 50/100); segments = 5 |
-| `0x4d` | `[4d, element, index, R, G, B, M, index*2]` | one color segment; **RGB = bytes 3-5** (verified: `ff0000` renders red, `00ff00` green, `0000ff` blue); `M` = interval/duration marker (`00/02/04/05` seen; `05` pulses visibly longer than `02`); last byte = `index*2` |
+| `0x4c` | `[4c, element, tempo, segments]` | table header; tempo ∈ {`0x28`,`0x32`,`0x64`}; segments ∈ {2, 5} (never more than 5) |
+| `0x4d` | `[4d, element, index, R, G, B, M, index*2]` | one color segment; **RGB = bytes 3-5** (verified: `ff0000` renders red, `00ff00` green, `0000ff` blue); `M` = interval/duration marker ∈ {`00`,`01`,`02`,`04`,`05`}; `index` ∈ 0..4; last byte = `index*2` (0..8) |
 | `0x4b` | `[4b, 0/1]` | lights off/on (commit; already known) |
+
+> **Safe value ranges** (from the original QuantumENGINE USB capture in
+> `pcaps/`): segment count **2 or 5 only**, tempo **`0x28`/`0x32`/`0x64`**,
+> frame index **0..4**, last byte **0..8**, and the `M` byte
+> **`0x00`/`0x01`/`0x02`/`0x04`/`0x05`**. Segment counts above 5 (the old
+> 16/32-segment "reset") wedge the lighting MCU into a strobe lockup. The
+> tray and `tools/jbl_rgb.py` hard-clamp every value to these ranges.
 
 Verified behavior (live on a Quantum 810 via hidraw):
 
 - **Arming required**: the lighting SETs only take effect after the
-  QuantumENGINE connect-time GET round (`0x50, 0x68, 0x51, 0x45, 0x67,
-  0x68, 0x5c, 0x62, 0x49, 0x47, 0x4a, 0x5b` in that order; `0x68` is
-  requested twice - this exact round is used by the tray and
-  `tools/jbl_rgb.py`). Without it the dongle
+  QuantumENGINE connect-time GET round (`0x68, 0x67, 0x62, 0x5c, 0x75,
+  0x49, 0x51, 0x47, 0x4a, 0x45` in that order - from the QuantumENGINE
+  capture in `pcaps/`). Without it the dongle
   still accepts and caches the SETs - the `0x4a` read-back even flips! -
   but the headset ignores them (no LED change, no `07` event). Arming
   persists for at least several minutes.
@@ -141,9 +147,11 @@ Verified behavior (live on a Quantum 810 via hidraw):
   first, then the QuantumENGINE-shape table).
 - **Segment count = pulse tempo** (live, 2026-09-17): the `0x4c` segment
   count sets how many segments share the tempo cycle - a 16-segment table
-  pulsed visibly "super fast". The final table therefore stays at the
-  stock 5; only the clearing pass uses more frames (tray
-  `LIGHT_RESET_SEGMENTS`, CLI `--reset-segments`).
+  pulsed visibly "super fast" and later wedged the lighting MCU into a
+  strobe. The capture confirms QuantumENGINE only ever sends 2 or 5
+  segments, so every write (clearing pass included) is now hard-clamped to
+  `1..5` (tray `LIGHT_MAX_SEGMENTS`, CLI `MAX_SEGMENTS`); the final table
+  stays at the stock 5.
 
 Open questions (not yet decoded):
 

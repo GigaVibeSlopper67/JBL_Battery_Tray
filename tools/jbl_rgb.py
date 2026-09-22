@@ -9,8 +9,8 @@ per lighting ELEMENT (0 = logo, 1 = ring on the earcups) an effect
 interval distribution follows a TEMPO slider. Over HID:
 
     GET round  "arming": the QuantumENGINE connect-time GETs
-               (0x50, 0x68, 0x51, 0x45, 0x67, 0x5c, 0x62, 0x49, 0x47,
-               0x4a, 0x5b) - REQUIRED before lighting SETs take effect
+               (0x68, 0x67, 0x62, 0x5c, 0x75, 0x49, 0x51, 0x47,
+               0x4a, 0x45) - REQUIRED before lighting SETs take effect
                (otherwise the dongle caches them, the headset ignores
                them). Arming persists for at least several minutes.
     SET 0x4c   [zone, tempo, segments]           table header
@@ -29,11 +29,11 @@ Two live-verified pitfalls cause the "color mixups":
     is therefore paced by WRITE_DELAY seconds (--delay).
   - The device table keeps colors from earlier writes beyond the 5 written
     segments ("residue"). --solid therefore writes TWO passes: a clearing
-    pass of --reset-segments identical frames (default 16, wipes every
-    slot), then the final QuantumENGINE-shape table (--segments, default
-    5). The 0x4c segment count also sets how many segments share the
-    tempo cycle - counts above 5 pulse visibly faster ("super fast"),
-    so the final table stays at 5.
+    pass of --reset-segments identical frames (default 5) then the final
+    QuantumENGINE-shape table (--segments, default 5). All segment counts
+    are hard-clamped to 1..5: the QuantumENGINE capture (pcaps/) only ever
+    sends 2 or 5 segments, and counts above 5 wedge the lighting MCU into
+    a strobe lockup (the old 16/32-segment "reset").
 
 CHANGES DEVICE STATE: colors persist until overwritten (QuantumENGINE on
 Windows can always restore them; `--default` replays the factory table).
@@ -41,7 +41,7 @@ Windows can always restore them; `--default` replays the factory table).
 Examples:
     python3 tools/jbl_rgb.py --status                 # read-only probe
     python3 tools/jbl_rgb.py --solid ff0000 --lights on
-    python3 tools/jbl_rgb.py --solid ff0000 --reset-segments 32   # wider clear
+    python3 tools/jbl_rgb.py --solid ff0000 --reset-segments 5    # full-table clear (max safe)
     python3 tools/jbl_rgb.py --solid 00ffcc --element logo --lights keep
     python3 tools/jbl_rgb.py --default --lights off   # factory teal + lights off
     python3 tools/jbl_rgb.py --raw "4c 00 64 05;4d 00 00 ff 00 00 02 00"
@@ -68,7 +68,16 @@ FEAT_TABLE_HEADER = 0x4C  # SET: [0x4c, element, tempo, segment_count]
 FEAT_TABLE_FRAME = 0x4D  # SET: [0x4d, element, index, R, G, B, M, index*2]
 FEAT_SET_LIGHTS = 0x4B    # SET: [0x4b, 0=off/1=on] (known)
 FRAME_COUNT = 5           # QuantumENGINE default segments per element
-RESET_SEGMENTS = 16       # clearing-pass slots per element (see --reset-segments)
+MAX_SEGMENTS = 5          # hard cap (QuantumENGINE capture: only 2 or 5 ever sent)
+RESET_SEGMENTS = 5        # clearing-pass slots per element (safe: == MAX_SEGMENTS)
+# Value ranges observed in the original QuantumENGINE USB capture (pcaps/).
+# Anything outside these wedged the lighting MCU into a strobe lockup (the
+# old 16/32-segment "reset" is what broke it): segment counts are 2 or 5
+# only, the 0x4c tempo byte is one of 0x28/0x32/0x64, and the 0x4d M byte is
+# one of 0x00/0x01/0x02/0x04/0x05. The frame index stays 0..4 and the last
+# byte stays 0..8 (index*2) - all implied by clamping segments to <= 5.
+SAFE_TEMPOS = (0x28, 0x32, 0x64)
+SAFE_MODES = (0x00, 0x01, 0x02, 0x04, 0x05)
 # Pause after each lighting SET_REPORT (pacing, live-verified need): the
 # dongle relays the writes to the headset over its 2.4 GHz link and drops
 # reports sent back-to-back (the ring's writes - last in the burst - went
@@ -81,8 +90,9 @@ ZONES = (0, 1)
 
 # QuantumENGINE connect-time GET round. Required before lighting SETs take
 # effect (verified live); the armed state persists for several minutes.
-ARM_GET_RIDS = (0x50, 0x68, 0x51, 0x45, 0x67, 0x68, 0x5C, 0x62,
-                0x49, 0x47, 0x4A, 0x5B)
+# Order taken from the original QuantumENGINE capture in pcaps/.
+ARM_GET_RIDS = (0x68, 0x67, 0x62, 0x5C, 0x75, 0x49,
+                0x51, 0x47, 0x4A, 0x45)
 
 # Factory table observed in headset-usb-connect.pcapng (QuantumENGINE pushes
 # this on connect): teal 33 ff cc frames, frame 2 = ff 00 cc, speed 0x64,
@@ -97,6 +107,23 @@ FACTORY_FRAMES = {
 
 def _hexs(data: bytes) -> str:
     return " ".join(f"{b:02x}" for b in data)
+
+
+def _clamp_segments(n: int) -> int:
+    """Clamp a segment count to QuantumENGINE's observed safe range (1..5)."""
+    return max(1, min(int(n), MAX_SEGMENTS))
+
+
+def _clamp_tempo(tempo: int) -> int:
+    """Clamp the 0x4c tempo byte to the values QuantumENGINE actually sends."""
+    tempo = int(tempo)
+    return tempo if tempo in SAFE_TEMPOS else min(SAFE_TEMPOS, key=lambda v: abs(v - tempo))
+
+
+def _clamp_mode(mode: int) -> int:
+    """Clamp the 0x4d M byte to the values QuantumENGINE actually sends."""
+    mode = int(mode)
+    return mode if mode in SAFE_MODES else min(SAFE_MODES, key=lambda v: abs(v - mode))
 
 
 def set_feature_bytes(reader: JblStatusReader, data: bytes,
@@ -144,6 +171,8 @@ def send_table(reader: JblStatusReader, frames: dict, speed: int = FACTORY_SPEED
     clears stale segments from earlier writes (the color mixups).
     """
     modes = modes or FACTORY_MODES
+    segments = _clamp_segments(segments)
+    speed = _clamp_tempo(speed)
     for zone in ZONES:
         if zone not in frames:
             continue
@@ -153,7 +182,8 @@ def send_table(reader: JblStatusReader, frames: dict, speed: int = FACTORY_SPEED
         print(f"  SET 0x4c zone {zone}: {_hexs(header)}")
         for i in range(segments):
             r, g, b = frames[zone][i % len(frames[zone])]
-            frame = bytes([FEAT_TABLE_FRAME, zone, i, r, g, b, modes.get(zone, 0x02), i * 2])
+            mode = _clamp_mode(modes.get(zone, 0x02))
+            frame = bytes([FEAT_TABLE_FRAME, zone, i, r, g, b, mode, i * 2])
             if not set_feature_bytes(reader, frame, delay):
                 return False
     if lights == "on":
@@ -239,21 +269,26 @@ def main() -> int:
     ap.add_argument("--raw", metavar="SEQ",
                     help="semicolon-separated hex feature reports, "
                          "e.g. '4c 00 64 05;4d 00 00 ff 00 00 02 00' - CHANGES DEVICE STATE")
-    ap.add_argument("--speed", type=lambda s: int(s, 0), default=None,
-                    help="speed byte for the 0x4c header (default 0x64; capture also shows 0x32)")
-    ap.add_argument("--mode", type=lambda s: int(s, 0), default=None,
-                    help="M byte for the 0x4d frames (default: 0x02 zone 0 / 0x05 zone 1)")
-    ap.add_argument("--segments", type=lambda s: int(s, 0), default=FRAME_COUNT,
-                    metavar="N",
+    ap.add_argument("--speed", type=lambda s: _clamp_tempo(int(s, 0)), default=None,
+                    help="speed byte for the 0x4c header (default 0x64; safe set: "
+                         "0x28/0x32/0x64 - other values are clamped to the nearest)")
+    ap.add_argument("--mode", type=lambda s: _clamp_mode(int(s, 0)), default=None,
+                    help="M byte for the 0x4d frames (default: 0x02 zone 0 / 0x05 "
+                         "zone 1; safe set 0x00/0x01/0x02/0x04/0x05 - other values "
+                         "are clamped to the nearest)")
+    ap.add_argument("--segments", type=lambda s: _clamp_segments(int(s, 0)),
+                    default=FRAME_COUNT, metavar="N",
                     help=f"final 0x4d table segments per element (default "
-                         f"{FRAME_COUNT}, QuantumENGINE-exact tempo; higher "
-                         "counts share the tempo cycle and pulse visibly "
-                         "faster)")
-    ap.add_argument("--reset-segments", type=lambda s: int(s, 0),
+                         f"{FRAME_COUNT}, QuantumENGINE-exact tempo; counts are "
+                         f"clamped to 1..{MAX_SEGMENTS} - QuantumENGINE never "
+                         "sends more than 5)")
+    ap.add_argument("--reset-segments",
+                    type=lambda s: 0 if int(s, 0) == 0 else _clamp_segments(int(s, 0)),
                     default=RESET_SEGMENTS, metavar="N",
                     help=f"clearing pass: overwrite N slots per element before "
-                         f"the final table (default {RESET_SEGMENTS}; 0 "
-                         "disables - clears stale colors of earlier writes)")
+                         f"the final table (default {RESET_SEGMENTS}; 0 disables; "
+                         f"clamped to 1..{MAX_SEGMENTS} - >5 wedged the lighting "
+                         "MCU)")
     ap.add_argument("--delay", type=float, default=WRITE_DELAY, metavar="SEC",
                     help=f"pause between SET reports (default {WRITE_DELAY}s; "
                          "raise it if writes are still dropped)")

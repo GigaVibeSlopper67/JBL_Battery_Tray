@@ -16,10 +16,11 @@ Diagnosed from the `ToDo.md` observations and fixed in both write paths:
   the colors before each change" recipe from the ToDo).
 - **Pulse tempo** (live test feedback): the `0x4c` segment count sets how
   many segments share the tempo cycle - 16 identical segments pulsed
-  "super fast". The write is now two-pass: clearing pass (16 frames,
-  wipes stale colors) followed by the final QuantumENGINE-shape table
-  (5 frames = stock tempo) (`LIGHT_RESET_SEGMENTS` / `--reset-segments`,
-  final `--segments` default 5).
+  "super fast" and later wedged the lighting MCU into a strobe lockup.
+  The original QuantumENGINE capture (`pcaps/`) confirms it only ever
+  sends 2 or 5 segments, so every write (clearing pass included) is now
+  hard-clamped to 1..5 (`LIGHT_MAX_SEGMENTS` / `MAX_SEGMENTS`); the final
+  table stays at 5 frames = stock tempo.
 - **Tray responsiveness** (live test feedback): the paced write sequence
   blocked the GTK main loop (tray "very slow"/froze). The lighting write
   now runs in a worker thread (busy-guarded, renders via `GLib.idle_add`).
